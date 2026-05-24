@@ -56,3 +56,12 @@ Supported extensions in Phase 1:
 
 - `.milk`
 - `.prjm`
+
+---
+
+## Structured Docs
+
+- docs/operations.md
+- docs/configuration.md
+- docs/integration.md
+- docs/troubleshooting.md
