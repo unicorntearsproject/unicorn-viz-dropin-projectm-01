@@ -228,6 +228,7 @@ class ProjectMEffect(BaseEffect):
     NAME = 'ProjectM Presets'
     AUTHOR = 'unicorn-viz drop-in'
     TAGS = ['projectm', 'milkdrop', 'audio', 'drop-in']
+    PING_PONG_FRIENDS: list[str] = ['Psychedelic', 'Kaleidoscope', 'Tunnel']
     HELP_ENTRIES = [
         ('ProjectM Presets', 'Ctrl+N', 'Next preset'),
         ('ProjectM Presets', 'Ctrl+P', 'Previous preset'),
@@ -353,6 +354,27 @@ class ProjectMEffect(BaseEffect):
             current = self._preset_index
             while self._preset_index == current:
                 self._preset_index = random.randrange(len(self._preset_paths))
+        self._load_current_preset(bool(self.config.get('smooth_transition', True)))
+        return self._active_label
+
+    @property
+    def preset_count(self) -> int:
+        """Return the total number of loaded presets (0 when none are available)."""
+        return len(self._preset_paths)
+
+    @property
+    def current_preset_index(self) -> int:
+        """Return the index of the currently displayed preset."""
+        return self._preset_index
+
+    def goto_preset(self, index: int) -> str | None:
+        """Go to a specific preset by index (wraps with modulo).
+
+        Returns the preset label, or ``None`` when no presets are loaded.
+        """
+        if not self._preset_paths:
+            return None
+        self._preset_index = int(index) % len(self._preset_paths)
         self._load_current_preset(bool(self.config.get('smooth_transition', True)))
         return self._active_label
 
