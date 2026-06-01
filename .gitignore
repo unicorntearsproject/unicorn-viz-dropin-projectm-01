@@ -2,3 +2,6 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .DS_Store
+
+# Preset packs — fetch with install.sh, not tracked in git
+presets/
