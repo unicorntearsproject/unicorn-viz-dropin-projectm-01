@@ -49,13 +49,52 @@ You can also set an explicit path via `projectm_library`.
 
 ## Presets
 
-Put preset files in `drop-ins/projectm-01/presets/` or point `preset_dir` /
-`preset_dirs` at a preset pack checkout.
+Preset packs are distributed as individual git repositories. The drop-in keeps
+them under `presets/`, one cloned repo per subdirectory, and recursively scans
+that tree for preset files. The `presets/` directory is git-ignored on purpose:
+packs are large and fetched on demand rather than committed here.
 
-Supported extensions in Phase 1:
+```
+drop-ins/projectm-01/presets/
+  presets-cream-of-the-crop/      # ~9,800 .milk presets
+  presets-milkdrop-original/      # ~550 .milk presets
+  presets-milkdrop-texture-pack/  # textures referenced by presets
+```
+
+### Fetching / updating packs
+
+Use the bundled helper (clones the curated default set, updates any already
+present — safe to re-run):
+
+```bash
+bash drop-ins/projectm-01/fetch_presets.sh
+```
+
+Add extra packs by URL (also cloned into `presets/`):
+
+```bash
+bash drop-ins/projectm-01/fetch_presets.sh https://github.com/some/other-pack.git
+```
+
+To make a pack part of the default set, add its URL to `DEFAULT_PACKS` near the
+top of `fetch_presets.sh`. List the current default set with `--list`.
+
+You can also just `git clone` any pack repo into `presets/` by hand — the
+scanner picks it up automatically on next launch.
+
+Supported preset extensions in Phase 1:
 
 - `.milk`
 - `.prjm`
+
+### Textures
+
+Many presets reference shared texture images. Point `texture_dirs` at the
+texture pack's inner `textures/` folder so they resolve:
+
+```toml
+texture_dirs = "drop-ins/projectm-01/presets/presets-milkdrop-texture-pack/textures"
+```
 
 ---
 
