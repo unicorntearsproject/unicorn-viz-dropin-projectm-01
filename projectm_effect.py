@@ -407,8 +407,10 @@ class ProjectMEffect(BaseEffect):
         return out
 
     def _texture_dirs(self) -> list[str]:
-        raw = str(self.config.get('texture_dirs', '')).strip()
-        out = [token.strip() for token in raw.split(',') if token.strip()]
+        raw = self.config.get('texture_dirs', '')
+        if isinstance(raw, list):
+            return [t.strip() for t in raw if str(t).strip()]
+        out = [token.strip() for token in str(raw).split(',') if token.strip()]
         return out
 
     def _scan_presets(self) -> list[Path]:
