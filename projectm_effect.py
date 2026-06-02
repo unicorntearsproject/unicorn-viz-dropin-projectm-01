@@ -3,6 +3,23 @@
 Phase 1 embeds libprojectM as a single Unicorn Viz effect using the C API via
 `ctypes`. When the native library or presets are unavailable, the effect falls
 back to an internal shader so the playlist remains stable.
+
+Diagnostics
+-----------
+Three libprojectM-4 callbacks are wired to Python's logging system:
+
+* **Global log callback** (``projectm_set_log_callback``): routes libprojectM's
+  own internal messages (shader compilation errors, I/O errors, etc.) into this
+  module's logger.  WARN and above are always forwarded; DEBUG/TRACE are
+  forwarded only when the Python log level is DEBUG.
+
+* **Preset-switch-failed callback**: fires with the failing preset filename and
+  the error message every time libprojectM rejects a preset (bad GLSL, corrupt
+  file).  These are logged at WARNING and also accumulated in
+  ``ProjectMEffect.failed_presets`` for inspection.
+
+* **Preset-switch-requested callback**: fires when libprojectM decides to
+  auto-advance.  Logged at DEBUG so normal operation stays quiet.
 """
 from __future__ import annotations
 
@@ -11,7 +28,6 @@ import ctypes.util
 import logging
 import random
 from pathlib import Path
-from typing import Iterable
 
 import moderngl
 import numpy as np
@@ -21,8 +37,35 @@ from unicornviz.effects.base import AudioData, BaseEffect
 
 log = logging.getLogger(__name__)
 
+# libprojectM log-level constants (projectm_log_level enum from logging.h)
+_PM_LOG_TRACE = 1
+_PM_LOG_DEBUG = 2
+_PM_LOG_INFO  = 3
+_PM_LOG_WARN  = 4
+_PM_LOG_ERROR = 5
+_PM_LOG_FATAL = 6
+
+# Map libprojectM levels to Python logging levels
+_PM_TO_PY_LEVEL: dict[int, int] = {
+    _PM_LOG_TRACE: logging.DEBUG,
+    _PM_LOG_DEBUG: logging.DEBUG,
+    _PM_LOG_INFO:  logging.INFO,
+    _PM_LOG_WARN:  logging.WARNING,
+    _PM_LOG_ERROR: logging.ERROR,
+    _PM_LOG_FATAL: logging.CRITICAL,
+}
+
 _GL_DRAW_FRAMEBUFFER_BINDING = 0x8CA6
 _PROJECTM_MONO = 1
+
+# ctypes callback types (kept alive as module-level to prevent GC)
+_LogCbType = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p)
+_SwitchFailedCbType = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p)
+_SwitchRequestedCbType = ctypes.CFUNCTYPE(None, ctypes.c_bool, ctypes.c_void_p)
+
+# Module-level log callback (global, not per-instance); stored here so the
+# ctypes wrapper is never garbage-collected while the library is loaded.
+_global_log_cb: _LogCbType | None = None
 
 _VERT = """
 #version 330
@@ -72,11 +115,15 @@ class _ProjectMBridge:
     def __init__(self, library_hint: str = '') -> None:
         self._lib = self._load_library(library_hint)
         self._bind_symbols()
+        self._install_log_callback()
         self._load_proc_cb = self._make_load_proc()
         self._handle = self._lib.projectm_create_with_opengl_load_proc(self._load_proc_cb, None)
         if not self._handle:
             raise RuntimeError('projectM instance creation failed')
         self._gl_get_integerv = self._make_gl_get_integerv()
+        # Per-instance callbacks (stored so ctypes wrappers survive GC)
+        self._switch_failed_cb: _SwitchFailedCbType | None = None
+        self._switch_requested_cb: _SwitchRequestedCbType | None = None
 
     @property
     def handle(self):
@@ -144,6 +191,23 @@ class _ProjectMBridge:
         self._gl_get_integerv(_GL_DRAW_FRAMEBUFFER_BINDING, ctypes.byref(value))
         return int(value.value)
 
+    def install_event_callbacks(
+        self,
+        on_switch_failed: _SwitchFailedCbType,
+        on_switch_requested: _SwitchRequestedCbType,
+    ) -> None:
+        """Register per-instance preset event callbacks."""
+        self._switch_failed_cb = on_switch_failed
+        self._switch_requested_cb = on_switch_requested
+        if hasattr(self._lib, 'projectm_set_preset_switch_failed_event_callback'):
+            self._lib.projectm_set_preset_switch_failed_event_callback(
+                self._handle, self._switch_failed_cb, None
+            )
+        if hasattr(self._lib, 'projectm_set_preset_switch_requested_event_callback'):
+            self._lib.projectm_set_preset_switch_requested_event_callback(
+                self._handle, self._switch_requested_cb, None
+            )
+
     @staticmethod
     def _load_library(library_hint: str) -> ctypes.CDLL:
         candidates: list[str] = []
@@ -202,6 +266,47 @@ class _ProjectMBridge:
         if hasattr(self._lib, 'projectm_set_texture_search_paths'):
             self._lib.projectm_set_texture_search_paths.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_size_t]
             self._lib.projectm_set_texture_search_paths.restype = None
+        # Callback registration functions (4.0+)
+        if hasattr(self._lib, 'projectm_set_preset_switch_failed_event_callback'):
+            self._lib.projectm_set_preset_switch_failed_event_callback.argtypes = [
+                ctypes.c_void_p, _SwitchFailedCbType, ctypes.c_void_p
+            ]
+            self._lib.projectm_set_preset_switch_failed_event_callback.restype = None
+        if hasattr(self._lib, 'projectm_set_preset_switch_requested_event_callback'):
+            self._lib.projectm_set_preset_switch_requested_event_callback.argtypes = [
+                ctypes.c_void_p, _SwitchRequestedCbType, ctypes.c_void_p
+            ]
+            self._lib.projectm_set_preset_switch_requested_event_callback.restype = None
+        # Global log callback (4.2+)
+        if hasattr(self._lib, 'projectm_set_log_callback'):
+            self._lib.projectm_set_log_callback.argtypes = [
+                _LogCbType, ctypes.c_bool, ctypes.c_void_p
+            ]
+            self._lib.projectm_set_log_callback.restype = None
+        if hasattr(self._lib, 'projectm_set_log_level'):
+            self._lib.projectm_set_log_level.argtypes = [ctypes.c_int, ctypes.c_bool]
+            self._lib.projectm_set_log_level.restype = None
+
+    def _install_log_callback(self) -> None:
+        """Wire libprojectM's internal log into Python's logging system (global, one-time)."""
+        global _global_log_cb
+        if _global_log_cb is not None:
+            return  # Already installed for this process
+        if not hasattr(self._lib, 'projectm_set_log_callback'):
+            return
+
+        def _on_pm_log(message: bytes, level: int, _user_data) -> None:
+            text = message.decode('utf-8', errors='replace').rstrip()
+            py_level = _PM_TO_PY_LEVEL.get(level, logging.DEBUG)
+            log.log(py_level, '[libprojectM] %s', text)
+
+        _global_log_cb = _LogCbType(_on_pm_log)
+
+        # Forward WARN+ always; include INFO/DEBUG only when Python logger is verbose
+        pm_level = _PM_LOG_DEBUG if log.isEnabledFor(logging.DEBUG) else _PM_LOG_WARN
+        if hasattr(self._lib, 'projectm_set_log_level'):
+            self._lib.projectm_set_log_level(pm_level, False)
+        self._lib.projectm_set_log_callback(_global_log_cb, False, None)
 
     @staticmethod
     def _make_load_proc():
@@ -251,6 +356,7 @@ class ProjectMEffect(BaseEffect):
         self._bass = 0.0
         self._mid = 0.0
         self._treble = 0.0
+        self.failed_presets: dict[str, str] = {}
 
         try:
             self._bridge = _ProjectMBridge(str(self.config.get('projectm_library', '')).strip())
@@ -263,6 +369,10 @@ class ProjectMEffect(BaseEffect):
                 bool(self.config.get('lock_preset', False)),
                 bool(self.config.get('start_clean', False)),
                 self._texture_dirs(),
+            )
+            self._bridge.install_event_callbacks(
+                self._make_switch_failed_cb(),
+                self._make_switch_requested_cb(),
             )
             self._load_start_preset()
             log.info('ProjectMEffect initialized with %d preset(s)', len(self._preset_paths))
@@ -329,9 +439,26 @@ class ProjectMEffect(BaseEffect):
         if self._bridge is None or not self._preset_paths:
             return
         path = self._preset_paths[self._preset_index % len(self._preset_paths)]
+        log.info('ProjectM loading preset [%d/%d]: %s', self._preset_index + 1, len(self._preset_paths), path.name)
         self._bridge.load_preset(str(path), smooth)
         self._active_label = path.stem
         self._preset_timer = 0.0
+
+    def _make_switch_failed_cb(self) -> _SwitchFailedCbType:
+        """Return a ctypes callback that logs preset load failures."""
+        def _on_failed(preset_filename: bytes, message: bytes, _user_data) -> None:
+            name = preset_filename.decode('utf-8', errors='replace') if preset_filename else '?'
+            msg  = message.decode('utf-8', errors='replace') if message else '?'
+            short = Path(name).name
+            self.failed_presets[name] = msg
+            log.warning('ProjectM preset failed: %s — %s', short, msg)
+        return _SwitchFailedCbType(_on_failed)
+
+    def _make_switch_requested_cb(self) -> _SwitchRequestedCbType:
+        """Return a ctypes callback that logs libprojectM-initiated preset advances."""
+        def _on_requested(is_hard_cut: bool, _user_data) -> None:
+            log.debug('ProjectM auto-advancing preset (hard_cut=%s)', is_hard_cut)
+        return _SwitchRequestedCbType(_on_requested)
 
     def next_preset(self) -> str | None:
         if not self._preset_paths:
