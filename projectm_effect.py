@@ -20,6 +20,14 @@ Three libprojectM-4 callbacks are wired to Python's logging system:
 
 * **Preset-switch-requested callback**: fires when libprojectM decides to
   auto-advance.  Logged at DEBUG so normal operation stays quiet.
+
+Dark-preset detection
+---------------------
+After ``dark_skip_after`` seconds on a preset (default 3 s), a 16×16 pixel
+sample is taken from the centre of the framebuffer via ``glReadPixels``.  If
+the average brightness is below ``dark_brightness_threshold`` (default 0.02,
+i.e. 2 %), the preset is skipped automatically.  Set ``dark_skip_enabled =
+false`` in ``[effects.ProjectMEffect]`` to disable.
 """
 from __future__ import annotations
 
@@ -58,7 +66,35 @@ _PM_TO_PY_LEVEL: dict[int, int] = {
 }
 
 _GL_DRAW_FRAMEBUFFER_BINDING = 0x8CA6
+_GL_RGB = 0x1907
+_GL_UNSIGNED_BYTE = 0x1401
 _PROJECTM_MONO = 1
+
+# Lazy-loaded glReadPixels symbol used by the dark-preset detector.
+_gl_read_pixels: ctypes._CFuncPtr | None = None
+
+
+def _get_glReadPixels() -> ctypes._CFuncPtr | None:
+    """Return a ctypes wrapper for glReadPixels, loading libGL on first call."""
+    global _gl_read_pixels
+    if _gl_read_pixels is not None:
+        return _gl_read_pixels
+    for lib_name in ('libGL.so.1', 'libGL.so', 'opengl32.dll', 'libGL.dylib'):
+        try:
+            lib = ctypes.CDLL(lib_name)
+            fn = lib.glReadPixels
+            fn.restype = None
+            fn.argtypes = [
+                ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                ctypes.c_uint, ctypes.c_uint,
+                ctypes.c_void_p,
+            ]
+            _gl_read_pixels = fn
+            return fn
+        except (OSError, AttributeError):
+            continue
+    return None
 
 # ctypes callback types (kept alive as module-level to prevent GC)
 _LogCbType = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p)
@@ -358,6 +394,8 @@ class ProjectMEffect(BaseEffect):
         self._preset_paths = self._scan_presets()
         self._preset_index = self.rng.integers(0, max(1, len(self._preset_paths))).item()
         self._preset_timer = 0.0
+        self._dark_skip_timer: float = 0.0
+        self._dark_check_needed: bool = False
         self._active_label = 'projectM fallback'
         self._bass = 0.0
         self._mid = 0.0
@@ -469,6 +507,8 @@ class ProjectMEffect(BaseEffect):
         self._bridge.load_preset(str(path), smooth)
         self._active_label = path.stem
         self._preset_timer = 0.0
+        self._dark_skip_timer = 0.0
+        self._dark_check_needed = False
 
     def _make_switch_failed_cb(self) -> _SwitchFailedCbType:
         """Return a ctypes callback that logs preset load failures."""
@@ -555,6 +595,11 @@ class ProjectMEffect(BaseEffect):
             if not bool(self.config.get('lock_preset', False)) and self._preset_paths:
                 if self._preset_timer >= max(2.0, float(self.parameters['preset_duration'])):
                     self.next_preset()
+                elif bool(self.config.get('dark_skip_enabled', True)) and not self._dark_check_needed:
+                    self._dark_skip_timer += dt
+                    dark_after = float(self.config.get('dark_skip_after', 3.0))
+                    if self._dark_skip_timer >= dark_after:
+                        self._dark_check_needed = True
 
     def resize(self, width: int, height: int) -> None:
         super().resize(width, height)
@@ -565,6 +610,12 @@ class ProjectMEffect(BaseEffect):
         if self._bridge is not None:
             try:
                 self._bridge.render()
+                if self._dark_check_needed:
+                    self._dark_check_needed = False
+                    if self._is_output_dark():
+                        log.info('Dark preset detected after %.1fs, skipping: %s',
+                                 self._dark_skip_timer, self._active_label)
+                        self.next_preset()
                 return
             except Exception as exc:
                 log.warning('ProjectM render failed; switching to fallback: %s', exc)
@@ -580,6 +631,32 @@ class ProjectMEffect(BaseEffect):
         self._fallback_prog['iMid'].value = self._mid
         self._fallback_prog['iTreble'].value = self._treble
         self._fallback_vao.render(moderngl.TRIANGLE_STRIP)
+
+    def _is_output_dark(self) -> bool:
+        """Return True when a pixel sample of the current framebuffer is near-black.
+
+        Reads a 16×16 block from the centre of the screen using glReadPixels.
+        Returns False (not dark) when the GL symbol cannot be loaded so the
+        detector silently degrades rather than skipping valid presets.
+        """
+        glrp = _get_glReadPixels()
+        if glrp is None:
+            return False
+        sample_w, sample_h = 16, 16
+        cx = max(0, self.width  // 2 - sample_w // 2)
+        cy = max(0, self.height // 2 - sample_h // 2)
+        buf = (ctypes.c_uint8 * (sample_w * sample_h * 3))()
+        try:
+            glrp(cx, cy, sample_w, sample_h, _GL_RGB, _GL_UNSIGNED_BYTE, buf)
+        except Exception as exc:
+            log.debug('glReadPixels failed in dark detector: %s', exc)
+            return False
+        total = sum(buf)
+        brightness = total / (sample_w * sample_h * 3 * 255.0)
+        threshold = float(self.config.get('dark_brightness_threshold', 0.02))
+        log.debug('Dark check: brightness=%.4f threshold=%.4f preset=%s',
+                  brightness, threshold, self._active_label)
+        return brightness < threshold
 
     def destroy(self) -> None:
         # Intentionally keep the shared bridge alive across effect switches to

@@ -100,6 +100,7 @@ texture_dirs = "drop-ins/projectm-01/presets/presets-milkdrop-texture-pack/textu
 
 ## Structured Docs
 
+- docs/planning.md
 - docs/operations.md
 - docs/configuration.md
 - docs/integration.md
