@@ -471,6 +471,7 @@ class ProjectMEffect(BaseEffect):
 
     def _scan_presets(self) -> list[Path]:
         exclude = self._exclude_dirs()
+        dark_excluded = self._load_dark_excluded()
         paths: set[Path] = set()
         for root in self._preset_dirs():
             for path in root.rglob('*'):
@@ -478,9 +479,13 @@ class ProjectMEffect(BaseEffect):
                     continue
                 if any(part.lower() in exclude for part in path.parts):
                     continue
+                if str(path.resolve()) in dark_excluded:
+                    continue
                 paths.add(path)
         if exclude:
             log.info('ProjectM preset scan: excluded dirs matching %s', sorted(exclude))
+        if dark_excluded:
+            log.info('ProjectM preset scan: skipped %d dark-excluded preset(s)', len(dark_excluded))
         return sorted(paths)
 
     def _load_start_preset(self) -> None:
@@ -613,9 +618,15 @@ class ProjectMEffect(BaseEffect):
                 if self._dark_check_needed:
                     self._dark_check_needed = False
                     if self._is_output_dark():
-                        log.info('Dark preset detected after %.1fs, skipping: %s',
-                                 self._dark_skip_timer, self._active_label)
-                        self.next_preset()
+                        dark_path = self._preset_paths[self._preset_index % len(self._preset_paths)]
+                        log.warning('Dark preset auto-excluded: %s', dark_path.name)
+                        self._save_dark_excluded_entry(dark_path)
+                        self._preset_paths.pop(self._preset_index % len(self._preset_paths))
+                        if self._preset_paths:
+                            self._preset_index = self._preset_index % len(self._preset_paths)
+                            self._load_current_preset(False)
+                        else:
+                            log.warning('All presets excluded — no presets remain')
                 return
             except Exception as exc:
                 log.warning('ProjectM render failed; switching to fallback: %s', exc)
@@ -657,6 +668,26 @@ class ProjectMEffect(BaseEffect):
         log.debug('Dark check: brightness=%.4f threshold=%.4f preset=%s',
                   brightness, threshold, self._active_label)
         return brightness < threshold
+
+    def _dark_excluded_file(self) -> Path:
+        """Return path to the persistent dark-preset exclusion list."""
+        return Path(__file__).parent / 'dark_excluded.txt'
+
+    def _load_dark_excluded(self) -> set[str]:
+        """Load the set of preset absolute path strings from the exclusion file."""
+        f = self._dark_excluded_file()
+        if not f.exists():
+            return set()
+        return {line.strip() for line in f.read_text(encoding='utf-8').splitlines() if line.strip()}
+
+    def _save_dark_excluded_entry(self, path: Path) -> None:
+        """Append a single preset path to the persistent exclusion file."""
+        f = self._dark_excluded_file()
+        try:
+            with f.open('a', encoding='utf-8') as fh:
+                fh.write(str(path.resolve()) + '\n')
+        except OSError as exc:
+            log.warning('Could not write dark_excluded.txt: %s', exc)
 
     def destroy(self) -> None:
         # Intentionally keep the shared bridge alive across effect switches to

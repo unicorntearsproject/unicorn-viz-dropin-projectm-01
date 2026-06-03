@@ -5,3 +5,6 @@ __pycache__/
 
 # Preset packs — fetch with install.sh, not tracked in git
 presets/
+
+# Per-machine dark-preset exclusion list (auto-populated at runtime)
+dark_excluded.txt
