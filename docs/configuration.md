@@ -2,7 +2,7 @@
 
 Owner: Drop-in Maintainers
 Status: active
-Last updated: 2026-05-24
+Last updated: 2026-06-03
 
 ## Purpose
 
@@ -31,6 +31,8 @@ start_preset = ""
 - Use `projectm_library` for explicit shared-library path when autodiscovery fails.
 - Use `preset_dir`/`preset_dirs` to point at external preset packs.
 - Keep `fps_hint` aligned with show target for smoother motion.
+- Preset manager state is persisted at `drop-ins/projectm-01/preset_manager_state.json`.
+- Non-permanent delete operations move presets into `drop-ins/projectm-01/preset-trash/`.
 
 ## Related Docs
 

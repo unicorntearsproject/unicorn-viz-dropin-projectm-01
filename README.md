@@ -7,6 +7,8 @@ the Unicorn Viz playlist and transition pipeline.
 
 - Load libprojectM via `ctypes`
 - Scan preset directories for `.milk` / `.prjm`
+- Build a preset catalog with inferred category paths from folder layout
+- Support manager-side preset state (`enabled` / `disabled` / deleted)
 - Feed live PCM waveform data from Unicorn Viz into projectM
 - Render projectM into the active Unicorn Viz framebuffer
 - Support next / previous / random preset switching
@@ -32,9 +34,12 @@ start_preset = ""
 
 ## Hotkeys
 
+- `Ctrl+M` — open preset manager
 - `Ctrl+N` — next preset
 - `Ctrl+P` — previous preset
 - `Ctrl+R` — random preset
+- `Delete` — soft-delete selected preset to trash from manager
+- `Shift+Delete` — hard-delete selected preset from manager
 
 ## Native Dependency
 
@@ -105,3 +110,16 @@ texture_dirs = "drop-ins/projectm-01/presets/presets-milkdrop-texture-pack/textu
 - docs/configuration.md
 - docs/integration.md
 - docs/troubleshooting.md
+
+## Manager Status
+
+The projectM manager is now available as an in-app modal browser with:
+
+- category browsing derived from preset folder layout
+- disabled presets shown inline with status flags
+- all / none / category enable-disable operations
+- category isolate action
+- soft delete to local trash with optional hard delete
+
+The follow-up roadmap for richer browsing and import workflows remains in
+`docs/planning.md`.
