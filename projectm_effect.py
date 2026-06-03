@@ -23,7 +23,7 @@ Three libprojectM-4 callbacks are wired to Python's logging system:
 
 Dark-preset detection
 ---------------------
-After ``dark_skip_after`` seconds on a preset (default 3 s), a 16×16 pixel
+After ``dark_skip_after`` seconds on a preset (default 3 s), a 100×100 pixel
 sample is taken from the centre of the framebuffer via ``glReadPixels``.  If
 the average brightness is below ``dark_brightness_threshold`` (default 0.02,
 i.e. 2 %), the preset is skipped automatically.  Set ``dark_skip_enabled =
@@ -642,7 +642,7 @@ class ProjectMEffect(BaseEffect):
         glrp = _get_glReadPixels()
         if glrp is None:
             return False
-        sample_w, sample_h = 16, 16
+        sample_w, sample_h = 100, 100
         cx = max(0, self.width  // 2 - sample_w // 2)
         cy = max(0, self.height // 2 - sample_h // 2)
         buf = (ctypes.c_uint8 * (sample_w * sample_h * 3))()
