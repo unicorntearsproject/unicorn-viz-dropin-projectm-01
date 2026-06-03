@@ -27,6 +27,8 @@ import ctypes
 import ctypes.util
 import logging
 import random
+import atexit
+import threading
 from pathlib import Path
 
 import moderngl
@@ -66,6 +68,10 @@ _SwitchRequestedCbType = ctypes.CFUNCTYPE(None, ctypes.c_bool, ctypes.c_void_p)
 # Module-level log callback (global, not per-instance); stored here so the
 # ctypes wrapper is never garbage-collected while the library is loaded.
 _global_log_cb: _LogCbType | None = None
+
+# Keep one bridge alive for the app lifetime so returning to ProjectM presets
+# does not need to recreate the native projectM engine each time.
+_shared_bridge: _ProjectMBridge | None = None
 
 _VERT = """
 #version 330
@@ -359,7 +365,12 @@ class ProjectMEffect(BaseEffect):
         self.failed_presets: dict[str, str] = {}
 
         try:
-            self._bridge = _ProjectMBridge(str(self.config.get('projectm_library', '')).strip())
+            library_hint = str(self.config.get('projectm_library', '')).strip()
+            global _shared_bridge
+            if _shared_bridge is None:
+                _shared_bridge = _ProjectMBridge(library_hint)
+                log.info('ProjectM bridge created')
+            self._bridge = _shared_bridge
             self._bridge.configure(
                 self.width,
                 self.height,
@@ -375,7 +386,7 @@ class ProjectMEffect(BaseEffect):
                 self._make_switch_requested_cb(),
             )
             self._load_start_preset()
-            log.info('ProjectMEffect initialized with %d preset(s)', len(self._preset_paths))
+            log.info('ProjectMEffect ready with %d preset(s)', len(self._preset_paths))
         except Exception as exc:
             self._bridge = None
             self._active_label = 'projectM unavailable'
@@ -558,6 +569,9 @@ class ProjectMEffect(BaseEffect):
             except Exception as exc:
                 log.warning('ProjectM render failed; switching to fallback: %s', exc)
                 self._bridge.destroy()
+                global _shared_bridge
+                if _shared_bridge is self._bridge:
+                    _shared_bridge = None
                 self._bridge = None
                 self._active_label = 'projectM render error'
 
@@ -568,9 +582,33 @@ class ProjectMEffect(BaseEffect):
         self._fallback_vao.render(moderngl.TRIANGLE_STRIP)
 
     def destroy(self) -> None:
-        if self._bridge is not None:
-            self._bridge.destroy()
-            self._bridge = None
+        # Intentionally keep the shared bridge alive across effect switches to
+        # avoid costly projectM re-initialization churn.
+        self._bridge = None
         self._fallback_vao.release()
         self._fallback_vbo.release()
         self._fallback_prog.release()
+
+
+def _shutdown_shared_bridge() -> None:
+    global _shared_bridge
+    if _shared_bridge is not None:
+        bridge = _shared_bridge
+        _shared_bridge = None
+
+        def _destroy_worker() -> None:
+            try:
+                bridge.destroy()
+            except Exception:
+                pass
+
+        worker = threading.Thread(
+            target=_destroy_worker,
+            name='uv-projectm-destroy',
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=1.0)
+
+
+atexit.register(_shutdown_shared_bridge)
