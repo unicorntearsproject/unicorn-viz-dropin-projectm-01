@@ -350,7 +350,7 @@ class ProjectMEffect(BaseEffect):
         self._fallback_vao, self._fallback_vbo = self._fullscreen_quad(self._fallback_prog)
         self._bridge: _ProjectMBridge | None = None
         self._preset_paths = self._scan_presets()
-        self._preset_index = 0
+        self._preset_index = self.rng.integers(0, max(1, len(self._preset_paths))).item()
         self._preset_timer = 0.0
         self._active_label = 'projectM fallback'
         self._bass = 0.0
@@ -413,12 +413,25 @@ class ProjectMEffect(BaseEffect):
         out = [token.strip() for token in str(raw).split(',') if token.strip()]
         return out
 
+    def _exclude_dirs(self) -> frozenset[str]:
+        """Return a frozenset of lowercased directory name fragments to exclude from scanning."""
+        raw = self.config.get('exclude_dirs', ['! Transition'])
+        if isinstance(raw, list):
+            return frozenset(s.strip().lower() for s in raw if str(s).strip())
+        return frozenset(s.strip().lower() for s in str(raw).split(',') if s.strip())
+
     def _scan_presets(self) -> list[Path]:
+        exclude = self._exclude_dirs()
         paths: set[Path] = set()
         for root in self._preset_dirs():
             for path in root.rglob('*'):
-                if path.suffix.lower() in {'.milk', '.prjm'}:
-                    paths.add(path)
+                if path.suffix.lower() not in {'.milk', '.prjm'}:
+                    continue
+                if any(part.lower() in exclude for part in path.parts):
+                    continue
+                paths.add(path)
+        if exclude:
+            log.info('ProjectM preset scan: excluded dirs matching %s', sorted(exclude))
         return sorted(paths)
 
     def _load_start_preset(self) -> None:
