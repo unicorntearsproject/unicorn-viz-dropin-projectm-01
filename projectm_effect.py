@@ -126,6 +126,11 @@ _global_log_cb: _LogCbType | None = None
 # does not need to recreate the native projectM engine each time.
 _shared_bridge: _ProjectMBridge | None = None
 
+# Module-level catalog cache: populated by warm_up() or on first _build_preset_catalog()
+# call, reused by every subsequent _init() so the 10k-file disk scan only happens once.
+# Invalidated and refreshed by refresh_preset_catalog() on any state change.
+_catalog_cache: list | None = None  # list[_PresetCatalogItem]
+
 _VERT = """
 #version 330
 in vec2 in_vert;
@@ -421,7 +426,15 @@ class ProjectMEffect(BaseEffect):
         self._deleted_presets: set[str] = set()
         self._preset_index = 0
         self._load_preset_state()
-        self.refresh_preset_catalog(preserve_current=False)
+
+        # Fast path: use the pre-built catalog from warm_up() or the last refresh.
+        # This skips the 10k-file disk scan on every effect switch.
+        if _catalog_cache is not None:
+            self._preset_catalog = _catalog_cache
+            self._preset_paths = [item.path for item in self._preset_catalog if item.enabled]
+            log.info('ProjectM using cached catalog: %d preset(s)', len(self._preset_catalog))
+        else:
+            self.refresh_preset_catalog(preserve_current=False)
         if self._preset_paths:
             self._preset_index = self.rng.integers(0, len(self._preset_paths)).item()
         self._preset_timer = 0.0
@@ -461,6 +474,69 @@ class ProjectMEffect(BaseEffect):
             self._bridge = None
             self._active_label = 'projectM unavailable'
             log.warning('ProjectMEffect falling back to shader mode: %s', exc)
+
+    @classmethod
+    def warm_up(cls, ctx: moderngl.Context, width: int, height: int, config: dict) -> None:
+        """Pre-build the preset catalog and create the shared bridge at app startup.
+
+        Called by app.py during the effect-warmup phase (same hook as
+        ``ImageShowcase.warm_cache``).  After this returns the first
+        ``_init()`` call on this class is near-instant: it finds both the
+        catalog already cached and the bridge already alive, eliminating the
+        disk-scan and GL-context-creation lag that previously caused a
+        visible freeze when the VJ switched to ProjectM.
+
+        Safe to call multiple times; returns immediately if already warm.
+        """
+        global _shared_bridge, _catalog_cache
+
+        if _catalog_cache is not None and _shared_bridge is not None:
+            log.debug('ProjectM warm_up: already warm, skipping')
+            return
+
+        # Build a minimal stub so we can reuse the instance methods that
+        # read config / disk without needing a full GL-context effect instance.
+        stub: ProjectMEffect = object.__new__(cls)
+        stub.config = config
+        stub._disabled_presets: set[str] = set()
+        stub._deleted_presets: set[str] = set()
+        try:
+            stub._load_preset_state()
+        except Exception as exc:
+            log.warning('ProjectM warm_up: state load failed: %s', exc)
+
+        # Build and cache the full preset catalog (the expensive 10k-file scan).
+        if _catalog_cache is None:
+            try:
+                _catalog_cache = stub._build_preset_catalog()
+                log.info('ProjectM warm_up: catalog cached (%d entries)', len(_catalog_cache))
+            except Exception as exc:
+                log.warning('ProjectM warm_up: catalog build failed: %s', exc)
+
+        # Create the shared libprojectM bridge and pre-load one preset so the
+        # GLSL compiler has already run before the first visible frame.
+        if _shared_bridge is None:
+            library_hint = str(config.get('projectm_library', '')).strip()
+            try:
+                _shared_bridge = _ProjectMBridge(library_hint)
+                fps_hint = int(config.get('fps_hint', 60))
+                _shared_bridge.configure(
+                    width, height, fps_hint,
+                    float(config.get('beat_sensitivity', 1.0)),
+                    float(config.get('preset_duration', 20.0)),
+                    bool(config.get('lock_preset', False)),
+                    bool(config.get('start_clean', False)),
+                    stub._texture_dirs(),
+                )
+                enabled = [item.path for item in _catalog_cache if item.enabled] if _catalog_cache else []
+                if enabled:
+                    _shared_bridge.load_preset(str(enabled[0]), False)
+                    log.info('ProjectM warm_up: bridge hot-standby ready (preset: %s)', enabled[0].name)
+                else:
+                    log.info('ProjectM warm_up: bridge ready (no presets to pre-load)')
+            except Exception as exc:
+                log.warning('ProjectM warm_up: bridge creation failed: %s', exc)
+                _shared_bridge = None
 
     @property
     def current_label(self) -> str:
@@ -763,6 +839,8 @@ class ProjectMEffect(BaseEffect):
             current_path = self._preset_paths[self._preset_index % len(self._preset_paths)]
 
         self._preset_catalog = self._build_preset_catalog()
+        global _catalog_cache
+        _catalog_cache = self._preset_catalog
         self._preset_paths = [item.path for item in self._preset_catalog if item.enabled]
 
         if not self._preset_paths:
