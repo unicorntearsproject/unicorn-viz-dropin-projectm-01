@@ -34,12 +34,9 @@ start_preset = ""
 
 ## Hotkeys
 
-- `Ctrl+M` — open preset manager
 - `Ctrl+N` — next preset
 - `Ctrl+P` — previous preset
 - `Ctrl+R` — random preset
-- `Delete` — soft-delete selected preset to trash from manager
-- `Shift+Delete` — hard-delete selected preset from manager
 
 ## Native Dependency
 
@@ -111,15 +108,15 @@ texture_dirs = "drop-ins/projectm-01/presets/presets-milkdrop-texture-pack/textu
 - docs/integration.md
 - docs/troubleshooting.md
 
-## Manager Status
+## Manager Backend Status
 
-The projectM manager is now available as an in-app modal browser with:
+The projectM manager backend is implemented in `projectm_effect.py` and
+currently provides:
 
-- category browsing derived from preset folder layout
-- disabled presets shown inline with status flags
-- all / none / category enable-disable operations
-- category isolate action
-- soft delete to local trash with optional hard delete
+- category inference from preset paths
+- all/none/category enable-disable operations
+- selected preset enable-disable operations
+- single and bulk delete operations with a local trash folder
 
-The follow-up roadmap for richer browsing and import workflows remains in
-`docs/planning.md`.
+The modal browser UI and hotkey wiring for interactive browsing are tracked in
+`docs/planning.md` and are intentionally staged separately.
