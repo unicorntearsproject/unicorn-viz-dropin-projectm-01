@@ -397,7 +397,7 @@ class ProjectMEffect(BaseEffect):
     NAME = 'ProjectM Presets'
     AUTHOR = 'unicorn-viz drop-in'
     TAGS = ['projectm', 'milkdrop', 'audio', 'drop-in']
-    PING_PONG_FRIENDS: list[str] = ['Psychedelic', 'Kaleidoscope', 'Tunnel']
+    PING_PONG_FRIENDS: list[str] = []
     HELP_ENTRIES = [
         ('ProjectM Presets', 'Ctrl+M', 'Open preset manager'),
         ('ProjectM Presets', '/', 'Enter manager search mode'),
