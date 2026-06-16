@@ -8,3 +8,11 @@ presets/
 
 # Per-machine dark-preset exclusion list (auto-populated at runtime)
 dark_excluded.txt
+
+# Runtime / editor / venv artefacts
+*.swp
+.venv/
+runtime/
+build/
+notes.md
+notes.txt
