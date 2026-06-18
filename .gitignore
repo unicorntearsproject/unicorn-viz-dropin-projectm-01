@@ -9,6 +9,10 @@ presets/
 # Per-machine dark-preset exclusion list (auto-populated at runtime)
 dark_excluded.txt
 
+# Preset manager state (runtime-generated, not source)
+preset_manager_state.json
+preset_manager_states/
+
 # Runtime / editor / venv artefacts
 *.swp
 .venv/
