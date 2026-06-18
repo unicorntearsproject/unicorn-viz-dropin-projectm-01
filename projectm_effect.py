@@ -34,11 +34,13 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import logging
+import os
 import random
 import atexit
 import json
 import re
 import shutil
+import tempfile
 import threading
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -49,6 +51,7 @@ import numpy as np
 import sdl2
 
 from unicornviz.effects.base import AudioData, BaseEffect
+from unicornviz.paths import APP_ROOT
 
 log = logging.getLogger(__name__)
 
@@ -578,8 +581,77 @@ class ProjectMEffect(BaseEffect):
         return frozenset(s.strip().lower() for s in str(raw).split(',') if s.strip())
 
     def _preset_state_file(self) -> Path:
-        """Return path to the persisted projectM manager state file."""
+        """Return the canonical persisted projectM manager state file path."""
+        return self._runtime_preset_state_file()
+
+    def _legacy_preset_state_file(self) -> Path:
+        """Return the legacy on-drop-in state file path."""
         return Path(__file__).parent / 'preset_manager_state.json'
+
+    def _runtime_preset_state_file(self) -> Path:
+        """Return the runtime state file path for projectM manager state."""
+        return APP_ROOT / 'runtime' / 'projectm' / 'preset_manager_state.json'
+
+    @staticmethod
+    def _load_state_payload(path: Path) -> dict[str, object] | None:
+        """Load and validate a projectM state payload from one JSON file."""
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning('ProjectM preset state load failed (%s): %s', path, exc)
+            return None
+        if not isinstance(payload, dict):
+            log.warning('ProjectM preset state payload is not a JSON object: %s', path)
+            return None
+        return payload
+
+    @staticmethod
+    def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+        """Write JSON payload atomically to reduce corruption risk on interruption."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(payload, indent=2, sort_keys=True) + '\n'
+        tmp_file = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                encoding='utf-8',
+                dir=path.parent,
+                prefix=f'.{path.name}.',
+                suffix='.tmp',
+                delete=False,
+            ) as handle:
+                tmp_file = Path(handle.name)
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_file, path)
+        finally:
+            if tmp_file is not None and tmp_file.exists():
+                try:
+                    tmp_file.unlink()
+                except OSError:
+                    pass
+
+    def _migrate_legacy_state_if_needed(self) -> None:
+        """Migrate legacy preset-manager state into runtime state location."""
+        runtime_state_file = self._runtime_preset_state_file()
+        if runtime_state_file.exists():
+            return
+        legacy_state_file = self._legacy_preset_state_file()
+        if not legacy_state_file.exists():
+            return
+        payload = self._load_state_payload(legacy_state_file)
+        if payload is None:
+            return
+        try:
+            self._write_json_atomic(runtime_state_file, payload)
+            log.info(
+                'ProjectM preset state migrated: %s -> %s',
+                legacy_state_file,
+                runtime_state_file,
+            )
+        except OSError as exc:
+            log.warning('ProjectM preset state migration failed: %s', exc)
 
     def _preset_trash_dir(self) -> Path:
         """Return path to the local preset quarantine directory."""
@@ -732,13 +804,16 @@ class ProjectMEffect(BaseEffect):
 
     def _load_preset_state(self) -> None:
         """Load persisted disabled/deleted preset state from disk."""
+        self._migrate_legacy_state_if_needed()
         state_file = self._preset_state_file()
         if not state_file.exists():
-            return
-        try:
-            payload = json.loads(state_file.read_text(encoding='utf-8'))
-        except (OSError, json.JSONDecodeError) as exc:
-            log.warning('ProjectM preset state load failed: %s', exc)
+            legacy_state_file = self._legacy_preset_state_file()
+            if legacy_state_file != state_file and legacy_state_file.exists():
+                state_file = legacy_state_file
+            else:
+                return
+        payload = self._load_state_payload(state_file)
+        if payload is None:
             return
 
         disabled = payload.get('disabled_presets', [])
@@ -757,10 +832,7 @@ class ProjectMEffect(BaseEffect):
             'deleted_presets': sorted(self._deleted_presets),
         }
         try:
-            state_file.write_text(
-                json.dumps(payload, indent=2, sort_keys=True) + '\n',
-                encoding='utf-8',
-            )
+            self._write_json_atomic(state_file, payload)
         except OSError as exc:
             log.warning('ProjectM preset state save failed: %s', exc)
 
