@@ -1,0 +1,28 @@
+repos:
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (unicorn-viz main-repo suite)
+        # This is a submodule with its own independent git history; a commit
+        # made here never touches the main repo's own pre-commit hooks. This
+        # hook closes that gap by running the SAME main-repo pytest suite
+        # (which exercises this submodule's code via tests/test_*.py) at the
+        # point the code actually changes, not just later when the main
+        # repo's submodule-pointer-bump commit happens.
+        entry: bash -c 'cd "$(git rev-parse --show-toplevel)/../.." && .venv/bin/python -m pytest -q'
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: ruff
+        name: ruff (unicorn-viz main-repo suite)
+        entry: bash -c 'cd "$(git rev-parse --show-toplevel)/../.." && .venv/bin/ruff check unicornviz/ tests/'
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: bandit
+        name: bandit (unicorn-viz main-repo suite)
+        entry: bash -c 'cd "$(git rev-parse --show-toplevel)/../.." && .venv/bin/bandit -r unicornviz/ drop-ins/ -ll -q'
+        language: system
+        pass_filenames: false
+        always_run: true
+
