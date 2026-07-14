@@ -1,5 +1,8 @@
 # projectm-01 — ProjectM Effect
 
+**Version 0.9.0**
+
+
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
 the Unicorn Viz playlist and transition pipeline.
 
@@ -120,3 +123,7 @@ currently provides:
 
 The modal browser UI and hotkey wiring for interactive browsing are tracked in
 `docs/planning.md` and are intentionally staged separately.
+
+## Changelog
+
+- **0.9.0** — initial versioned release.
