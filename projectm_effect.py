@@ -136,6 +136,10 @@ _shared_bridge: _ProjectMBridge | None = None
 # Invalidated and refreshed by refresh_preset_catalog() on any state change.
 _catalog_cache: list | None = None  # list[_PresetCatalogItem]
 
+# Guards the one-time catalog build so prescan_catalog_async() (background,
+# during the splash) and warm_up() (main thread, after it) never both scan.
+_catalog_lock = threading.Lock()
+
 _VERT = """
 #version 330
 in vec2 in_vert;
@@ -481,6 +485,52 @@ class ProjectMEffect(BaseEffect):
             log.warning('ProjectMEffect falling back to shader mode: %s', exc)
 
     @classmethod
+    def _build_catalog_cache(cls, config: dict, *, source: str) -> None:
+        """Populate the module-level ``_catalog_cache`` once (the 10k-file scan).
+
+        Lock-guarded so the background prescan and the main-thread ``warm_up``
+        can call it concurrently without double-scanning; whichever arrives
+        first does the work, the other returns immediately.  No GL — pure
+        config + disk reads via a throwaway stub instance.
+        """
+        global _catalog_cache
+        with _catalog_lock:
+            if _catalog_cache is not None:
+                return
+            stub: ProjectMEffect = object.__new__(cls)
+            stub.config = config
+            stub._disabled_presets = set()
+            stub._deleted_presets = set()
+            try:
+                stub._load_preset_state()
+            except Exception as exc:
+                log.warning('ProjectM %s: state load failed: %s', source, exc)
+            try:
+                _catalog_cache = stub._build_preset_catalog()
+                log.info('ProjectM %s: catalog cached (%d entries)', source, len(_catalog_cache))
+            except Exception as exc:
+                log.warning('ProjectM %s: catalog build failed: %s', source, exc)
+
+    @classmethod
+    def prescan_catalog_async(cls, config: dict) -> None:
+        """Build the preset catalog on a background thread at app startup.
+
+        Called before the splash screen so the ~10k-file preset scan (the
+        non-GL half of ``warm_up``) overlaps the splash instead of stalling
+        boot after it.  The GL bridge half stays in ``warm_up`` on the main
+        thread.  Mirrors ``ImageShowcase.prefetch_async``.
+        """
+        if _catalog_cache is not None:
+            return
+        threading.Thread(
+            target=cls._build_catalog_cache,
+            args=(config,),
+            kwargs={'source': 'prescan'},
+            daemon=True,
+            name='projectm-prescan',
+        ).start()
+
+    @classmethod
     def warm_up(cls, ctx: moderngl.Context, width: int, height: int, config: dict) -> None:
         """Pre-build the preset catalog and create the shared bridge at app startup.
 
@@ -499,24 +549,12 @@ class ProjectMEffect(BaseEffect):
             log.debug('ProjectM warm_up: already warm, skipping')
             return
 
-        # Build a minimal stub so we can reuse the instance methods that
-        # read config / disk without needing a full GL-context effect instance.
-        stub: ProjectMEffect = object.__new__(cls)
-        stub.config = config
-        stub._disabled_presets: set[str] = set()
-        stub._deleted_presets: set[str] = set()
-        try:
-            stub._load_preset_state()
-        except Exception as exc:
-            log.warning('ProjectM warm_up: state load failed: %s', exc)
-
-        # Build and cache the full preset catalog (the expensive 10k-file scan).
-        if _catalog_cache is None:
-            try:
-                _catalog_cache = stub._build_preset_catalog()
-                log.info('ProjectM warm_up: catalog cached (%d entries)', len(_catalog_cache))
-            except Exception as exc:
-                log.warning('ProjectM warm_up: catalog build failed: %s', exc)
+        # Build + cache the full preset catalog (the expensive 10k-file scan).
+        # This half is pure disk I/O and can run ahead of time on a background
+        # thread — see prescan_catalog_async(), kicked off during the splash.
+        # When it did, this call finds the cache already populated and only the
+        # GL bridge below (which must stay on this, the GL, thread) remains.
+        cls._build_catalog_cache(config, source='warm_up')
 
         # Create the shared libprojectM bridge and pre-load one preset so the
         # GLSL compiler has already run before the first visible frame.
@@ -525,13 +563,17 @@ class ProjectMEffect(BaseEffect):
             try:
                 _shared_bridge = _ProjectMBridge(library_hint)
                 fps_hint = int(config.get('fps_hint', 60))
+                # Throwaway stub only to reuse the config-driven texture-dir
+                # resolution (no GL, no disk beyond path building).
+                dir_stub: ProjectMEffect = object.__new__(cls)
+                dir_stub.config = config
                 _shared_bridge.configure(
                     width, height, fps_hint,
                     float(config.get('beat_sensitivity', 1.0)),
                     float(config.get('preset_duration', 20.0)),
                     bool(config.get('lock_preset', False)),
                     bool(config.get('start_clean', False)),
-                    stub._texture_dirs(),
+                    dir_stub._texture_dirs(),
                 )
                 enabled = [item.path for item in _catalog_cache if item.enabled] if _catalog_cache else []
                 if enabled:
