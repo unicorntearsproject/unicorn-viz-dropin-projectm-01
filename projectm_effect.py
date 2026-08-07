@@ -23,15 +23,32 @@ Three libprojectM-4 callbacks are wired to Python's logging system:
 
 Dark-preset detection
 ---------------------
-After ``dark_skip_after`` seconds on a preset (default 3 s), a 100×100 pixel
-sample is taken from the centre of the framebuffer via ``glReadPixels``.  If
-the average brightness is below ``dark_brightness_threshold`` (default 0.02,
-i.e. 2 %), the preset is skipped automatically.  Set ``dark_skip_enabled =
-false`` in ``[effects.ProjectMEffect]`` to disable.
+After ``dark_skip_after`` seconds on a preset (default 0.2 s — this is a VJ
+backdrop, not a MilkDrop viewer, so a multi-second warm-up reads as a dead
+screen), five 48×48 blocks spread across the framebuffer are sampled via
+``glReadPixels`` and averaged.  If the mean brightness is below
+``dark_brightness_threshold`` (default 0.02, i.e. 2 %), the preset is skipped
+and recorded permanently.  The check runs at most once per preset, never per
+frame, and only while ProjectM is the active effect.  Set ``dark_skip_enabled
+= false`` in ``[effects.ProjectMEffect]`` to disable.
+
+Excluded presets are recorded in ``dark_excluded.txt`` as paths **relative to
+this drop-in directory**, so the list keeps working from any checkout; legacy
+absolute entries are rebased and de-duplicated automatically on first read.
+
+Preset warm-up priming
+----------------------
+``preset_warmup_frames`` (default 0, off) renders that many throwaway frames
+immediately after a preset loads, before the first visible frame.  A preset's
+"warm-up" is its feedback texture filling in over successive rendered frames,
+not a time ramp — so claiming a later frame time does nothing for it, and only
+actually running frames arrives pre-warmed.  Costs those frames once per preset
+change; raise it if slow-building presets are being excluded that you want to
+keep.
 """
 from __future__ import annotations
 
-__version__ = '0.9.0'
+__version__ = '0.10.0'
 
 import ctypes
 import ctypes.util
@@ -135,6 +152,12 @@ _shared_bridge: _ProjectMBridge | None = None
 # call, reused by every subsequent _init() so the 10k-file disk scan only happens once.
 # Invalidated and refreshed by refresh_preset_catalog() on any state change.
 _catalog_cache: list | None = None  # list[_PresetCatalogItem]
+# Marker used to rebase legacy absolute entries in dark_excluded.txt.
+_DARK_PATH_MARKER = '/drop-ins/projectm-01/'
+# Seconds a preset may stay near-black before it is auto-excluded.
+# Deliberately short: this is a VJ backdrop, not a MilkDrop viewer,
+# and a multi-second warm-up reads as a dead screen.
+_DARK_SKIP_AFTER_DEFAULT = 0.2
 
 # Guards the one-time catalog build so prescan_catalog_async() (background,
 # during the splash) and warm_up() (main thread, after it) never both scan.
@@ -258,6 +281,23 @@ class _ProjectMBridge:
             self._lib.projectm_opengl_render_frame_fbo(self._handle, ctypes.c_uint32(fbo))
         else:
             self._lib.projectm_opengl_render_frame(self._handle)
+
+    def prime(self, frames: int, base_time: float, step: float) -> None:
+        """Render throwaway frames to warm a freshly-loaded preset.
+
+        A MilkDrop preset's "warm-up" is its feedback texture filling in over
+        successive rendered frames — it is not a time ramp, so telling projectM
+        a later frame time does nothing for it (this effect already reports a
+        large randomized time via ``set_timing``).  The only way to arrive
+        pre-warmed is to actually run frames, which is what this does.
+
+        Every frame lands in the currently bound draw FBO and is immediately
+        overdrawn by the caller's real render in the same tick, so nothing
+        intermediate reaches the screen.
+        """
+        for i in range(max(0, int(frames))):
+            self._lib.projectm_set_frame_time(self._handle, float(base_time + step * (i + 1)))
+            self.render()
 
     def _current_draw_fbo(self) -> int:
         value = ctypes.c_int(0)
@@ -450,6 +490,10 @@ class ProjectMEffect(BaseEffect):
         self._dark_skip_timer: float = 0.0
         self._dark_check_needed: bool = False
         self._manager_preview_active = False
+        # Set on every preset load, consumed by render(). Initialised here as
+        # well because _load_current_preset() early-returns when no bridge or
+        # no presets exist, and render() reads it unconditionally.
+        self._prime_pending: int = 0
         self._active_label = 'projectM fallback'
         self._bass = 0.0
         self._mid = 0.0
@@ -908,7 +952,7 @@ class ProjectMEffect(BaseEffect):
                 if any(part.lower() in exclude for part in path.parts):
                     continue
                 abs_path = str(path.resolve())
-                if abs_path in dark_excluded:
+                if self._dark_key(path) in dark_excluded:
                     continue
                 if abs_path in self._deleted_presets:
                     continue
@@ -1227,6 +1271,10 @@ class ProjectMEffect(BaseEffect):
         self._preset_timer = 0.0
         self._dark_skip_timer = 0.0
         self._dark_check_needed = False
+        # Consumed at the top of the next render(), where the draw FBO is
+        # correctly bound — priming here (inside update()) would render into
+        # whatever target the app happens to have bound at the time.
+        self._prime_pending = int(self.config.get('preset_warmup_frames', 0))
 
     def _make_switch_failed_cb(self) -> _SwitchFailedCbType:
         """Return a ctypes callback that logs preset load failures."""
@@ -1369,7 +1417,7 @@ class ProjectMEffect(BaseEffect):
                     self.next_preset()
                 elif bool(self.config.get('dark_skip_enabled', True)) and not self._dark_check_needed:
                     self._dark_skip_timer += dt
-                    dark_after = float(self.config.get('dark_skip_after', 3.0))
+                    dark_after = float(self.config.get('dark_skip_after', _DARK_SKIP_AFTER_DEFAULT))
                     if self._dark_skip_timer >= dark_after:
                         self._dark_check_needed = True
 
@@ -1381,6 +1429,10 @@ class ProjectMEffect(BaseEffect):
     def render(self) -> None:
         if self._bridge is not None:
             try:
+                if self._prime_pending > 0:
+                    frames = self._prime_pending
+                    self._prime_pending = 0
+                    self._bridge.prime(frames, float(self.time), 1.0 / 60.0)
                 self._bridge.render()
                 if self._dark_check_needed and not self._manager_preview_active:
                     self._dark_check_needed = False
@@ -1388,6 +1440,7 @@ class ProjectMEffect(BaseEffect):
                         dark_path = self._preset_paths[self._preset_index % len(self._preset_paths)]
                         log.warning('Dark preset auto-excluded: %s', dark_path.name)
                         self._save_dark_excluded_entry(dark_path)
+                        self._drop_from_catalog_cache(dark_path)
                         self._preset_paths.pop(self._preset_index % len(self._preset_paths))
                         if self._preset_paths:
                             self._preset_index = self._preset_index % len(self._preset_paths)
@@ -1410,51 +1463,165 @@ class ProjectMEffect(BaseEffect):
         self._fallback_prog['iTreble'].value = self._treble
         self._fallback_vao.render(moderngl.TRIANGLE_STRIP)
 
-    def _is_output_dark(self) -> bool:
-        """Return True when a pixel sample of the current framebuffer is near-black.
+    # Sample-block centres as fractions of the frame: middle plus four points
+    # out toward the corners.  A single centre block only saw 0.48% of a 1080p
+    # frame (0.12% at 4K), so presets that are lively at the edges and empty in
+    # the middle read as black.  Five smaller blocks cover the frame far better
+    # for the same number of bytes read.
+    _DARK_SAMPLE_POINTS = ((0.50, 0.50), (0.25, 0.25), (0.75, 0.25),
+                           (0.25, 0.75), (0.75, 0.75))
+    _DARK_SAMPLE_SIZE = 48
 
-        Reads a 16×16 block from the centre of the screen using glReadPixels.
-        Returns False (not dark) when the GL symbol cannot be loaded so the
-        detector silently degrades rather than skipping valid presets.
+    def _is_output_dark(self) -> bool:
+        """Return True when the current framebuffer samples as near-black.
+
+        Reads five 48×48 blocks spread across the frame via ``glReadPixels``
+        and averages them.  Runs at most once per preset (gated by
+        ``_dark_check_needed``), never per frame, and only while ProjectM is
+        the active effect — so this costs nothing when ProjectM is not on
+        screen.  Returns False (not dark) when the GL symbol cannot be loaded
+        so the detector degrades silently rather than skipping valid presets.
         """
         glrp = _get_glReadPixels()
         if glrp is None:
             return False
-        sample_w, sample_h = 100, 100
-        cx = max(0, self.width  // 2 - sample_w // 2)
-        cy = max(0, self.height // 2 - sample_h // 2)
-        buf = (ctypes.c_uint8 * (sample_w * sample_h * 3))()
-        try:
-            glrp(cx, cy, sample_w, sample_h, _GL_RGB, _GL_UNSIGNED_BYTE, buf)
-        except Exception as exc:
-            log.debug('glReadPixels failed in dark detector: %s', exc)
+        size = self._DARK_SAMPLE_SIZE
+        buf = (ctypes.c_uint8 * (size * size * 3))()
+        total = 0
+        blocks = 0
+        for fx, fy in self._DARK_SAMPLE_POINTS:
+            px = int(self.width * fx) - size // 2
+            py = int(self.height * fy) - size // 2
+            px = max(0, min(px, max(0, self.width - size)))
+            py = max(0, min(py, max(0, self.height - size)))
+            try:
+                glrp(px, py, size, size, _GL_RGB, _GL_UNSIGNED_BYTE, buf)
+            except Exception as exc:
+                log.debug('glReadPixels failed in dark detector: %s', exc)
+                return False
+            total += sum(buf)
+            blocks += 1
+        if blocks == 0:
             return False
-        total = sum(buf)
-        brightness = total / (sample_w * sample_h * 3 * 255.0)
+        brightness = total / (blocks * size * size * 3 * 255.0)
         threshold = float(self.config.get('dark_brightness_threshold', 0.02))
-        log.debug('Dark check: brightness=%.4f threshold=%.4f preset=%s',
-                  brightness, threshold, self._active_label)
+        log.debug('Dark check: brightness=%.4f threshold=%.4f blocks=%d preset=%s',
+                  brightness, threshold, blocks, self._active_label)
         return brightness < threshold
+
+    @staticmethod
+    def _dropin_root() -> Path:
+        """Directory this drop-in lives in — the base for exclusion keys."""
+        return Path(__file__).resolve().parent
 
     def _dark_excluded_file(self) -> Path:
         """Return path to the persistent dark-preset exclusion list."""
-        return Path(__file__).parent / 'dark_excluded.txt'
+        return self._dropin_root() / 'dark_excluded.txt'
+
+    @classmethod
+    def _dark_key(cls, path: Path) -> str:
+        """Relative POSIX key identifying a preset in the exclusion list.
+
+        Keys are stored relative to the drop-in directory so the list keeps
+        working when the repository is used from a different checkout.  The
+        list used to hold absolute paths, which silently matched nothing in
+        any clone but the one that wrote them — the whole list went dead and
+        every already-known-dark preset had to be re-detected the slow way.
+        """
+        resolved = path.resolve()
+        try:
+            return resolved.relative_to(cls._dropin_root()).as_posix()
+        except ValueError:
+            return resolved.as_posix()
+
+    @classmethod
+    def _dark_key_from_line(cls, line: str) -> str:
+        """Normalize one stored line into a relative key.
+
+        Accepts legacy absolute entries and rebases them onto this drop-in
+        when they carry the drop-in marker, so an accumulated list survives
+        the migration instead of being discarded.
+        """
+        text = line.strip().replace('\\', '/')
+        if not text:
+            return ''
+        if not text.startswith('/'):
+            return text.lstrip('./')
+        idx = text.find(_DARK_PATH_MARKER)
+        if idx >= 0:
+            return text[idx + len(_DARK_PATH_MARKER):]
+        return text
 
     def _load_dark_excluded(self) -> set[str]:
-        """Load the set of preset absolute path strings from the exclusion file."""
+        """Load the exclusion list as relative keys, migrating the file if needed.
+
+        Rewrites the file in relative form (de-duplicated) the first time it
+        encounters legacy absolute entries, so the migration happens once.
+        """
         f = self._dark_excluded_file()
         if not f.exists():
             return set()
-        return {line.strip() for line in f.read_text(encoding='utf-8').splitlines() if line.strip()}
+        try:
+            raw = f.read_text(encoding='utf-8').splitlines()
+        except OSError as exc:
+            log.warning('Could not read dark_excluded.txt: %s', exc)
+            return set()
+
+        keys: list[str] = []
+        seen: set[str] = set()
+        changed = False
+        for line in raw:
+            stripped = line.strip()
+            if not stripped:
+                changed = True
+                continue
+            key = self._dark_key_from_line(stripped)
+            if not key:
+                changed = True
+                continue
+            if key != stripped:
+                changed = True
+            if key in seen:
+                changed = True          # duplicate from a pre-fix re-detection
+                continue
+            seen.add(key)
+            keys.append(key)
+
+        if changed:
+            try:
+                f.write_text('\n'.join(keys) + '\n', encoding='utf-8')
+                log.info('ProjectM dark-exclusion list migrated to relative paths '
+                         '(%d entries, %d line(s) normalized/de-duplicated)',
+                         len(keys), len(raw) - len(keys))
+            except OSError as exc:
+                log.warning('Could not migrate dark_excluded.txt: %s', exc)
+        return seen
 
     def _save_dark_excluded_entry(self, path: Path) -> None:
-        """Append a single preset path to the persistent exclusion file."""
+        """Append a single preset to the persistent exclusion file."""
         f = self._dark_excluded_file()
         try:
             with f.open('a', encoding='utf-8') as fh:
-                fh.write(str(path.resolve()) + '\n')
+                fh.write(self._dark_key(path) + '\n')
         except OSError as exc:
             log.warning('Could not write dark_excluded.txt: %s', exc)
+
+    @staticmethod
+    def _drop_from_catalog_cache(path: Path) -> None:
+        """Remove a preset from the process-wide catalog cache.
+
+        ``_init`` rebuilds ``_preset_paths`` from ``_catalog_cache`` on every
+        effect switch, so without this a preset excluded at runtime comes
+        straight back the next time ProjectM is activated — costing another
+        ``dark_skip_after`` of black screen and appending another duplicate
+        line — because the dark detector only popped the instance-local list.
+        """
+        global _catalog_cache
+        with _catalog_lock:
+            if _catalog_cache is None:
+                return
+            target = path.resolve()
+            _catalog_cache = [it for it in _catalog_cache if it.path.resolve() != target]
 
     def destroy(self) -> None:
         # Intentionally keep the shared bridge alive across effect switches to
