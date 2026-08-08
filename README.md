@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.10.1**
+**Version 0.10.2**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -125,6 +125,18 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 `docs/planning.md` and are intentionally staged separately.
 
 ## Changelog
+
+- **0.10.2** — stop rebuilding the preset catalog from disk on every state
+  change. Disabling or trashing a preset from a hotkey re-walked all ~10,000
+  preset files and called `Path.resolve()` on each one, synchronously inside
+  event handling — measured as an **11-second full-app freeze** twice in one
+  session on the owner's rig, under concurrent OBS record+stream disk load.
+  Nothing on disk changes when a preset is disabled, so the walk is cached and
+  the catalog is rebuilt by re-applying filters in memory; the resolved path
+  from the cached scan is reused for the dark-exclusion key instead of
+  re-resolving per file. Locally 0.82 s -> 0.27 s, and the disk walk is gone
+  from the hotkey path entirely. `rescan_preset_files()` forces a fresh walk
+  when the presets on disk really did change.
 
 - **0.10.1** — hold the timer-driven preset advance while a scene crossfade
   is running. `projectm_load_preset_file` compiles the preset's shaders

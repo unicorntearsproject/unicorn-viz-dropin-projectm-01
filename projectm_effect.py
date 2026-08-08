@@ -48,7 +48,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.10.1'
+__version__ = '0.10.2'
 
 import ctypes
 import ctypes.util
@@ -147,6 +147,11 @@ _global_log_cb: _LogCbType | None = None
 # Keep one bridge alive for the app lifetime so returning to ProjectM presets
 # does not need to recreate the native projectM engine each time.
 _shared_bridge: _ProjectMBridge | None = None
+
+# Module-level filesystem-scan cache: the raw preset walk, independent of
+# which presets are currently enabled/disabled/trashed.  Cleared only by
+# rescan_preset_files(); see _scan_preset_files() for why.
+_file_scan_cache: list[tuple[Path, Path, str]] | None = None
 
 # Module-level catalog cache: populated by warm_up() or on first _build_preset_catalog()
 # call, reused by every subsequent _init() so the 10k-file disk scan only happens once.
@@ -940,44 +945,73 @@ class ProjectMEffect(BaseEffect):
                 tags.add(token)
         return tuple(sorted(tags))
 
-    def _build_preset_catalog(self) -> list[_PresetCatalogItem]:
-        """Scan configured preset roots and build catalog entries."""
-        exclude = self._exclude_dirs()
-        dark_excluded = self._load_dark_excluded()
-        entries: list[_PresetCatalogItem] = []
+    def _scan_preset_files(self) -> list[tuple[Path, Path, str]]:
+        """Walk the preset roots once and cache ``(path, root, abs_path)``.
+
+        This is the expensive part -- ~10,000 files plus a ``resolve()``
+        syscall each, which measured **11 seconds** on the owner's rig.  It
+        used to run on every catalog refresh, including the ones triggered
+        by disabling or trashing a single preset from a hotkey, freezing the
+        whole app mid-set each time.
+
+        Nothing on disk changes when a preset is disabled -- only the
+        filters do -- so the walk is cached here and
+        ``_build_preset_catalog()`` re-applies state to it in memory.  Call
+        ``rescan_preset_files()`` when the presets on disk really did
+        change.
+        """
+        global _file_scan_cache
+        if _file_scan_cache is not None:
+            return _file_scan_cache
+        scanned: list[tuple[Path, Path, str]] = []
         for root in self._preset_dirs():
             for path in root.rglob('*'):
                 if path.suffix.lower() not in {'.milk', '.prjm'}:
                     continue
-                if any(part.lower() in exclude for part in path.parts):
-                    continue
-                abs_path = str(path.resolve())
-                if self._dark_key(path) in dark_excluded:
-                    continue
-                if abs_path in self._deleted_presets:
-                    continue
+                scanned.append((path, root, str(path.resolve())))
+        log.info('ProjectM preset scan: walked %d preset file(s)', len(scanned))
+        _file_scan_cache = scanned
+        return scanned
 
-                rel = path.relative_to(root)
-                rel_parts = rel.parts
-                if len(rel_parts) >= 2:
-                    pack_name = rel_parts[0]
-                    category_parts = tuple(rel_parts[1:-1])
-                else:
-                    pack_name = root.name
-                    category_parts = tuple(rel_parts[:-1])
-                display_name = path.stem
-                tags = self._infer_tags(category_parts, display_name)
+    def rescan_preset_files(self) -> None:
+        """Drop the cached filesystem walk so the next build re-reads disk."""
+        global _file_scan_cache
+        _file_scan_cache = None
 
-                entries.append(
-                    _PresetCatalogItem(
-                        path=path,
-                        display_name=display_name,
-                        pack_name=pack_name,
-                        category_path=category_parts,
-                        tags=tags,
-                        enabled=abs_path not in self._disabled_presets,
-                    )
+    def _build_preset_catalog(self) -> list[_PresetCatalogItem]:
+        """Build catalog entries by applying current state to the file scan."""
+        exclude = self._exclude_dirs()
+        dark_excluded = self._load_dark_excluded()
+        entries: list[_PresetCatalogItem] = []
+        for path, root, abs_path in self._scan_preset_files():
+            if any(part.lower() in exclude for part in path.parts):
+                continue
+            if self._dark_key_for_abs(abs_path) in dark_excluded:
+                continue
+            if abs_path in self._deleted_presets:
+                continue
+
+            rel = path.relative_to(root)
+            rel_parts = rel.parts
+            if len(rel_parts) >= 2:
+                pack_name = rel_parts[0]
+                category_parts = tuple(rel_parts[1:-1])
+            else:
+                pack_name = root.name
+                category_parts = tuple(rel_parts[:-1])
+            display_name = path.stem
+            tags = self._infer_tags(category_parts, display_name)
+
+            entries.append(
+                _PresetCatalogItem(
+                    path=path,
+                    display_name=display_name,
+                    pack_name=pack_name,
+                    category_path=category_parts,
+                    tags=tags,
+                    enabled=abs_path not in self._disabled_presets,
                 )
+            )
 
         if exclude:
             log.info('ProjectM preset scan: excluded dirs matching %s', sorted(exclude))
@@ -1541,6 +1575,21 @@ class ProjectMEffect(BaseEffect):
             return resolved.relative_to(cls._dropin_root()).as_posix()
         except ValueError:
             return resolved.as_posix()
+
+    @classmethod
+    def _dark_key_for_abs(cls, abs_path: str) -> str:
+        """``_dark_key`` for an already-resolved path.
+
+        The catalog build has the resolved path in hand from the cached file
+        scan, so going back through ``Path.resolve()`` would re-issue one
+        syscall per preset -- thousands of them on every rebuild, for an
+        answer that cannot have changed.
+        """
+        root = cls._dropin_root().as_posix()
+        text = abs_path.replace('\\', '/')
+        if text.startswith(f'{root}/'):
+            return text[len(root) + 1:]
+        return text
 
     @classmethod
     def _dark_key_from_line(cls, line: str) -> str:
