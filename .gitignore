@@ -3,8 +3,13 @@ __pycache__/
 *.egg-info/
 .DS_Store
 
-# Preset packs — fetch with install.sh, not tracked in git
+# Preset packs — fetch with install.sh, not tracked in git.  MilkDrop presets
+# were, in almost all cases, never released under an explicit license and their
+# authors retain copyright, so we redistribute none of them; each operator
+# fetches their own.  preset-trash/ holds presets culled at runtime and must
+# stay untracked for the same reason.
 presets/
+preset-trash/
 
 # Per-machine dark-preset exclusion list (auto-populated at runtime)
 dark_excluded.txt
