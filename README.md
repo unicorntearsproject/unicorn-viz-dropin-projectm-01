@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.10.0**
+**Version 0.10.1**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -125,6 +125,15 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 `docs/planning.md` and are intentionally staged separately.
 
 ## Changelog
+
+- **0.10.1** — hold the timer-driven preset advance while a scene crossfade
+  is running. `projectm_load_preset_file` compiles the preset's shaders
+  synchronously on the render thread, and during a blend the app is already
+  rendering two effects every frame, so a compile landing there is what turns
+  a transition into a visible hitch. The preset timer keeps accumulating, so
+  the switch happens as soon as the blend finishes — at most a second or two
+  later on a 20 s preset duration. Uses the new `BaseEffect.transition_active`
+  flag (core 1.0.0-beta.55).
 
 - **0.10.0** — dark-exclusion overhaul: the list was mostly not working, so
   presets already known to be black were replayed, each costing a fresh

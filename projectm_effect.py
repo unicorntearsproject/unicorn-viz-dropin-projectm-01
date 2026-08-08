@@ -48,7 +48,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.10.0'
+__version__ = '0.10.1'
 
 import ctypes
 import ctypes.util
@@ -1414,7 +1414,15 @@ class ProjectMEffect(BaseEffect):
                 and self._preset_paths
             ):
                 if self._preset_timer >= max(2.0, float(self.parameters['preset_duration'])):
-                    self.next_preset()
+                    # Hold the advance while a scene crossfade is running.
+                    # projectm_load_preset_file compiles the preset's shaders
+                    # synchronously on the render thread, and during a blend
+                    # two effects are already rendering every frame — landing
+                    # a compile there is what turns a transition into a
+                    # visible hitch.  The timer keeps accumulating, so the
+                    # switch happens as soon as the blend finishes.
+                    if not self.transition_active:
+                        self.next_preset()
                 elif bool(self.config.get('dark_skip_enabled', True)) and not self._dark_check_needed:
                     self._dark_skip_timer += dt
                     dark_after = float(self.config.get('dark_skip_after', _DARK_SKIP_AFTER_DEFAULT))
