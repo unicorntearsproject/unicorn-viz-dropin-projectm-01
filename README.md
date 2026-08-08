@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.10.2**
+**Version 0.10.3**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -125,6 +125,14 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 `docs/planning.md` and are intentionally staged separately.
 
 ## Changelog
+
+- **0.10.3** — trashing a preset no longer rebuilds the catalog on the render
+  thread at all. The playback list is pruned in place so the advance to the
+  next preset stays correct, and the full catalog rebuild runs on a
+  `projectm-catalog` worker; the result is installed at the top of the next
+  `update()`, never by the worker itself, so nothing swaps the catalog while
+  update/render are walking it. Superseded rebuilds are dropped via a
+  generation counter.
 
 - **0.10.2** — stop rebuilding the preset catalog from disk on every state
   change. Disabling or trashing a preset from a hotkey re-walked all ~10,000

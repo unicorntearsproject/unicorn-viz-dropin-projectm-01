@@ -48,7 +48,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.10.2'
+__version__ = '0.10.3'
 
 import ctypes
 import ctypes.util
@@ -152,6 +152,11 @@ _shared_bridge: _ProjectMBridge | None = None
 # which presets are currently enabled/disabled/trashed.  Cleared only by
 # rescan_preset_files(); see _scan_preset_files() for why.
 _file_scan_cache: list[tuple[Path, Path, str]] | None = None
+
+# Guards the background catalog rebuild hand-off.  Module level because the
+# caches it protects are module level too, and because it must exist even for
+# instances built without running _init() (the manager tests do exactly that).
+_catalog_lock = threading.Lock()
 
 # Module-level catalog cache: populated by warm_up() or on first _build_preset_catalog()
 # call, reused by every subsequent _init() so the 10k-file disk scan only happens once.
@@ -464,6 +469,11 @@ class ProjectMEffect(BaseEffect):
         ('ProjectM Presets', 'Shift+Delete', 'Hard-delete selected preset'),
     ]
     _TOKEN_RE = re.compile(r'[a-z0-9]+')
+
+    #: Background-rebuild hand-off; class defaults keep partially built
+    #: instances (tests, warm-up stubs) working without special-casing.
+    _catalog_generation: int = 0
+    _pending_catalog: tuple[list[_PresetCatalogItem], bool] | None = None
 
     def _init(self) -> None:
         self.parameters = {
@@ -1026,13 +1036,64 @@ class ProjectMEffect(BaseEffect):
             ),
         )
 
-    def refresh_preset_catalog(self, preserve_current: bool = True) -> None:
-        """Rebuild manager catalog and enabled playback list from current state."""
+    def refresh_preset_catalog(
+        self,
+        preserve_current: bool = True,
+        *,
+        background: bool = False,
+    ) -> None:
+        """Rebuild manager catalog and enabled playback list from current state.
+
+        With ``background=True`` the rebuild runs on a worker thread and the
+        result is swapped in at the top of the next ``update()``.  The build
+        is pure computation over a cached file scan, so the render thread
+        only pays for the swap.  Callers needing the catalog immediately
+        must leave this False.
+        """
+        if background:
+            with _catalog_lock:
+                self._catalog_generation += 1
+                generation = self._catalog_generation
+            threading.Thread(
+                target=self._refresh_catalog_worker,
+                args=(preserve_current, generation),
+                name='projectm-catalog',
+                daemon=True,
+            ).start()
+            return
+        self._apply_preset_catalog(self._build_preset_catalog(), preserve_current)
+
+    def _refresh_catalog_worker(self, preserve_current: bool, generation: int) -> None:
+        """Build the catalog off-thread; hand it to update() to install."""
+        try:
+            catalog = self._build_preset_catalog()
+        except Exception as exc:
+            log.warning('ProjectM background catalog refresh failed: %s', exc)
+            return
+        with _catalog_lock:
+            if generation != self._catalog_generation:
+                return  # a newer request superseded this one mid-build
+            self._pending_catalog = (catalog, preserve_current)
+
+    def _install_pending_catalog(self) -> None:
+        """Apply a completed background rebuild.  Render thread only."""
+        with _catalog_lock:
+            pending = self._pending_catalog
+            self._pending_catalog = None
+        if pending is not None:
+            self._apply_preset_catalog(*pending)
+
+    def _apply_preset_catalog(
+        self,
+        catalog: list[_PresetCatalogItem],
+        preserve_current: bool = True,
+    ) -> None:
+        """Install a built catalog and re-point the playback index."""
         current_path: Path | None = None
         if preserve_current and self._preset_paths:
             current_path = self._preset_paths[self._preset_index % len(self._preset_paths)]
 
-        self._preset_catalog = self._build_preset_catalog()
+        self._preset_catalog = catalog
         global _catalog_cache
         _catalog_cache = self._preset_catalog
         self._preset_paths = [item.path for item in self._preset_catalog if item.enabled]
@@ -1221,7 +1282,17 @@ class ProjectMEffect(BaseEffect):
         self._deleted_presets.add(target_key)
         self._disabled_presets.discard(target_key)
         self._save_preset_state()
-        self.refresh_preset_catalog()
+        # Prune the playback list right here so the advance below is correct,
+        # then rebuild the full catalog off-thread.  Rebuilding inline is what
+        # froze the whole app mid-set on this exact keypress.
+        self._preset_paths = [
+            path for path in self._preset_paths
+            if str(path.resolve()) != target_key
+        ]
+        self._preset_index = (
+            self._preset_index % len(self._preset_paths) if self._preset_paths else 0
+        )
+        self.refresh_preset_catalog(background=True)
 
         if self._bridge is not None:
             if self._preset_paths:
@@ -1422,6 +1493,7 @@ class ProjectMEffect(BaseEffect):
 
     def update(self, dt: float, audio: AudioData) -> None:
         super().update(dt, audio)
+        self._install_pending_catalog()
         self._bass = float(audio.bass)
         self._mid = float(audio.mid)
         self._treble = float(audio.treble)
