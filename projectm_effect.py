@@ -21,24 +21,40 @@ Three libprojectM-4 callbacks are wired to Python's logging system:
 * **Preset-switch-requested callback**: fires when libprojectM decides to
   auto-advance.  Logged at DEBUG so normal operation stays quiet.
 
-Dark-preset detection
----------------------
-Every ``dark_skip_after`` seconds a preset stays active (default 0.2 s —
-this is a VJ backdrop, not a MilkDrop viewer, so a multi-second warm-up
-reads as a dead screen), five 48×48 blocks spread across the framebuffer
-are sampled via ``glReadPixels`` and averaged.  If the mean brightness is
-below ``dark_brightness_threshold`` (default 0.02, i.e. 2 %), the preset
-is skipped and recorded permanently.  The check re-arms every
-``dark_skip_after`` interval for as long as the preset stays active (not
-just once) — deliberately, so a preset that starts bright and fades to
-black over several seconds still gets caught, not just one that opens
-already dark.  It never runs more than once per interval; only while
-ProjectM is the active effect.  Set ``dark_skip_enabled = false`` in
-``[effects.ProjectMEffect]`` to disable.
+Solid-color preset detection
+-----------------------------
+This is a VJ backdrop, not a MilkDrop viewer — a preset that sits on one
+flat color for any real stretch of time reads as a dead stream, whether
+that color is black, white, or a saturated wall of red.  So every
+rendered frame while a preset is active, five 48×48 blocks spread across
+the framebuffer (see ``_COLOR_SAMPLE_POINTS``) are sampled via
+``glReadPixels`` and pooled into one combined set of pixel values.  If
+their standard deviation is below ``solid_color_std_threshold`` (default
+4.0, out of 255), that frame counts as "functionally one color" —
+sampling all five spread-out blocks together, not just one, means a
+frame that's genuinely half one color and half another still reads as
+high-variance and is correctly not flagged, even though each block might
+look locally flat on its own.
 
-Excluded presets are recorded in ``dark_excluded.txt`` as paths **relative to
-this drop-in directory**, so the list keeps working from any checkout; legacy
-absolute entries are rebased and de-duplicated automatically on first read.
+``solid_color_duration`` (default 0.2 s) is how long the screen has to
+stay *continuously* solid-color before the preset is excluded — a single
+solid-color frame doesn't count, but 0.2 s of them in a row does.  The
+running streak resets to zero the instant a frame reads as not-flat, so
+a preset that goes solid black, recovers, then goes solid blue two
+seconds later still gets caught — the two spans don't need to match or
+connect, either one independently crossing the duration threshold is
+enough.  There is deliberately no warm-up grace period before tracking
+starts: a preset that opens on a flat color and takes its time waking up
+reads exactly as bad on a live stream as one that's permanently flat, so
+both trigger identically (raise ``preset_warmup_frames`` instead if a
+specific slow-building preset is worth keeping).  Set
+``solid_color_skip_enabled = false`` in ``[effects.ProjectMEffect]`` to
+disable the whole mechanism.
+
+Excluded presets are recorded permanently in ``excluded_presets.txt`` as
+paths **relative to this drop-in directory**, so the list keeps working
+from any checkout; legacy absolute entries are rebased and de-duplicated
+automatically on first read.
 
 Preset warm-up priming
 ----------------------
@@ -52,7 +68,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.10.4'
+__version__ = '0.11.0'
 
 import ctypes
 import ctypes.util
@@ -65,6 +81,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,7 +118,7 @@ _GL_RGB = 0x1907
 _GL_UNSIGNED_BYTE = 0x1401
 _PROJECTM_MONO = 1
 
-# Lazy-loaded glReadPixels symbol used by the dark-preset detector.
+# Lazy-loaded glReadPixels symbol used by the solid-color-preset detector.
 _gl_read_pixels: ctypes._CFuncPtr | None = None
 
 
@@ -166,12 +183,16 @@ _catalog_lock = threading.Lock()
 # call, reused by every subsequent _init() so the 10k-file disk scan only happens once.
 # Invalidated and refreshed by refresh_preset_catalog() on any state change.
 _catalog_cache: list | None = None  # list[_PresetCatalogItem]
-# Marker used to rebase legacy absolute entries in dark_excluded.txt.
-_DARK_PATH_MARKER = '/drop-ins/projectm-01/'
-# Seconds a preset may stay near-black before it is auto-excluded.
-# Deliberately short: this is a VJ backdrop, not a MilkDrop viewer,
-# and a multi-second warm-up reads as a dead screen.
-_DARK_SKIP_AFTER_DEFAULT = 0.2
+# Marker used to rebase legacy absolute entries in excluded_presets.txt.
+_EXCLUSION_PATH_MARKER = '/drop-ins/projectm-01/'
+# Seconds a preset may stay continuously on one flat color before it is
+# auto-excluded. Deliberately short: this is a VJ backdrop, not a
+# MilkDrop viewer, and a multi-second stretch of solid color reads as a
+# dead screen.
+_SOLID_COLOR_DURATION_DEFAULT = 0.2
+# Standard deviation (0-255 scale) of the pooled sampled pixels below
+# which a frame counts as "functionally one color".
+_SOLID_COLOR_STD_THRESHOLD_DEFAULT = 4.0
 
 # Guards the one-time catalog build so prescan_catalog_async() (background,
 # during the splash) and warm_up() (main thread, after it) never both scan.
@@ -506,9 +527,28 @@ class ProjectMEffect(BaseEffect):
         if self._preset_paths:
             self._preset_index = self.rng.integers(0, len(self._preset_paths)).item()
         self._preset_timer = 0.0
-        self._dark_skip_timer: float = 0.0
-        self._dark_check_needed: bool = False
+        # How long (seconds) the framebuffer has read as continuously one
+        # flat color; _solid_color_check_time is the time.monotonic() of
+        # the last sample, used to compute the per-render-call elapsed
+        # time (render() doesn't receive dt). None means no sample has
+        # been taken yet for the current preset.
+        self._solid_color_duration: float = 0.0
+        self._solid_color_check_time: float | None = None
         self._manager_preview_active = False
+        # Reentrancy guard: refuse a second preset load inside the same
+        # tick. Two independent triggers (this effect's own preset_duration
+        # timer, an external caller such as auto-vj-01) landing in the same
+        # frame would otherwise both fire, and the first preset swapped in
+        # would never get a chance to run a single solid-color sample.
+        # _update_tick increments once per update() call; render() reads
+        # it without incrementing, so a load triggered from either method
+        # in the same frame shares the same tick number.
+        self._update_tick: int = 0
+        self._preset_load_tick: int = -1
+        # Preallocated once and reused for every solid-color sample --
+        # _is_frame_solid_color() runs every render() frame, so a fresh
+        # ctypes buffer per call would be a real per-frame allocation.
+        self._color_sample_buf = (ctypes.c_uint8 * (self._COLOR_SAMPLE_SIZE ** 2 * 3))()
         # Set on every preset load, consumed by render(). Initialised here as
         # well because _load_current_preset() early-returns when no bridge or
         # no presets exist, and render() reads it unconditionally.
@@ -995,12 +1035,12 @@ class ProjectMEffect(BaseEffect):
     def _build_preset_catalog(self) -> list[_PresetCatalogItem]:
         """Build catalog entries by applying current state to the file scan."""
         exclude = self._exclude_dirs()
-        dark_excluded = self._load_dark_excluded()
+        excluded_presets = self._load_excluded_presets()
         entries: list[_PresetCatalogItem] = []
         for path, root, abs_path in self._scan_preset_files():
             if any(part.lower() in exclude for part in path.parts):
                 continue
-            if self._dark_key_for_abs(abs_path) in dark_excluded:
+            if self._exclusion_key_for_abs(abs_path) in excluded_presets:
                 continue
             if abs_path in self._deleted_presets:
                 continue
@@ -1029,8 +1069,8 @@ class ProjectMEffect(BaseEffect):
 
         if exclude:
             log.info('ProjectM preset scan: excluded dirs matching %s', sorted(exclude))
-        if dark_excluded:
-            log.info('ProjectM preset scan: skipped %d dark-excluded preset(s)', len(dark_excluded))
+        if excluded_presets:
+            log.info('ProjectM preset scan: skipped %d excluded preset(s)', len(excluded_presets))
         return sorted(
             entries,
             key=lambda item: (
@@ -1373,13 +1413,29 @@ class ProjectMEffect(BaseEffect):
     def _load_current_preset(self, smooth: bool) -> None:
         if self._bridge is None or not self._preset_paths:
             return
+        if self._preset_load_tick == self._update_tick:
+            # Reentrancy guard: something already loaded a preset this
+            # exact tick -- two independent advance triggers (this
+            # effect's own preset_duration timer, an external caller such
+            # as auto-vj-01) landed in the same frame. Refuse the second
+            # one rather than swap the preset out again before it ever got
+            # a chance to run a single solid-color sample. Logged at
+            # WARNING because this indicates an upstream coordination gap,
+            # not routine behavior.
+            log.warning(
+                'ProjectM: refused a second preset load in the same tick '
+                '(tick=%d) -- the previous preset had no chance to be '
+                'solid-color-checked', self._update_tick,
+            )
+            return
+        self._preset_load_tick = self._update_tick
         path = self._preset_paths[self._preset_index % len(self._preset_paths)]
         log.info('ProjectM loading preset [%d/%d]: %s', self._preset_index + 1, len(self._preset_paths), path.name)
         self._bridge.load_preset(str(path), smooth)
         self._active_label = path.stem
         self._preset_timer = 0.0
-        self._dark_skip_timer = 0.0
-        self._dark_check_needed = False
+        self._solid_color_duration = 0.0
+        self._solid_color_check_time = None
         # Consumed at the top of the next render(), where the draw FBO is
         # correctly bound — priming here (inside update()) would render into
         # whatever target the app happens to have bound at the time.
@@ -1492,11 +1548,16 @@ class ProjectMEffect(BaseEffect):
         self._manager_preview_active = bool(active)
         if self._manager_preview_active:
             self._preset_timer = 0.0
-            self._dark_skip_timer = 0.0
-            self._dark_check_needed = False
+            self._solid_color_duration = 0.0
+            self._solid_color_check_time = None
 
     def update(self, dt: float, audio: AudioData) -> None:
         super().update(dt, audio)
+        # See _load_current_preset()'s reentrancy guard: this increments
+        # once per frame so a load from update()'s own auto-advance and a
+        # load from render()'s solid-color exclusion (or an external
+        # caller reaching in the same frame) share one tick number.
+        self._update_tick += 1
         self._install_pending_catalog()
         self._bass = float(audio.bass)
         self._mid = float(audio.mid)
@@ -1533,21 +1594,8 @@ class ProjectMEffect(BaseEffect):
                     # switch happens as soon as the blend finishes.
                     if not self.transition_active:
                         self.next_preset()
-                elif bool(self.config.get('dark_skip_enabled', True)) and not self._dark_check_needed:
-                    self._dark_skip_timer += dt
-                    dark_after = float(self.config.get('dark_skip_after', _DARK_SKIP_AFTER_DEFAULT))
-                    if self._dark_skip_timer >= dark_after:
-                        self._dark_check_needed = True
-                        # Reset for the *next* check, not just this one: without
-                        # this, the timer stays >= dark_after forever after the
-                        # first trip, so the moment render() clears
-                        # _dark_check_needed back to False next frame, this
-                        # branch re-arms it immediately -- degrading "check
-                        # once per dark_after interval" into "check every
-                        # single frame" for the rest of the preset's life
-                        # (confirmed live: one preset logged 307 dark checks
-                        # over its run instead of the intended handful).
-                        self._dark_skip_timer = 0.0
+                # Solid-color tracking itself happens in render() (it needs
+                # the just-drawn framebuffer) -- see _update_solid_color_tracking().
 
     def resize(self, width: int, height: int) -> None:
         super().resize(width, height)
@@ -1562,19 +1610,13 @@ class ProjectMEffect(BaseEffect):
                     self._prime_pending = 0
                     self._bridge.prime(frames, float(self.time), 1.0 / 60.0)
                 self._bridge.render()
-                if self._dark_check_needed and not self._manager_preview_active:
-                    self._dark_check_needed = False
-                    if self._is_output_dark():
-                        dark_path = self._preset_paths[self._preset_index % len(self._preset_paths)]
-                        log.warning('Dark preset auto-excluded: %s', dark_path.name)
-                        self._save_dark_excluded_entry(dark_path)
-                        self._drop_from_catalog_cache(dark_path)
-                        self._preset_paths.pop(self._preset_index % len(self._preset_paths))
-                        if self._preset_paths:
-                            self._preset_index = self._preset_index % len(self._preset_paths)
-                            self._load_current_preset(False)
-                        else:
-                            log.warning('All presets excluded — no presets remain')
+                if (
+                    not self._manager_preview_active
+                    and not bool(self.config.get('lock_preset', False))
+                    and self._preset_paths
+                    and bool(self.config.get('solid_color_skip_enabled', True))
+                ):
+                    self._update_solid_color_tracking()
                 return
             except Exception as exc:
                 log.warning('ProjectM render failed; switching to fallback: %s', exc)
@@ -1594,30 +1636,37 @@ class ProjectMEffect(BaseEffect):
     # Sample-block centres as fractions of the frame: middle plus four points
     # out toward the corners.  A single centre block only saw 0.48% of a 1080p
     # frame (0.12% at 4K), so presets that are lively at the edges and empty in
-    # the middle read as black.  Five smaller blocks cover the frame far better
+    # the middle read as flat.  Five smaller blocks cover the frame far better
     # for the same number of bytes read.
-    _DARK_SAMPLE_POINTS = ((0.50, 0.50), (0.25, 0.25), (0.75, 0.25),
-                           (0.25, 0.75), (0.75, 0.75))
-    _DARK_SAMPLE_SIZE = 48
+    _COLOR_SAMPLE_POINTS = ((0.50, 0.50), (0.25, 0.25), (0.75, 0.25),
+                            (0.25, 0.75), (0.75, 0.75))
+    _COLOR_SAMPLE_SIZE = 48
 
-    def _is_output_dark(self) -> bool:
-        """Return True when the current framebuffer samples as near-black.
+    def _is_frame_solid_color(self) -> bool:
+        """Return True when the current framebuffer samples as one flat color.
 
         Reads five 48×48 blocks spread across the frame via ``glReadPixels``
-        and averages them.  Runs at most once per preset (gated by
-        ``_dark_check_needed``), never per frame, and only while ProjectM is
-        the active effect — so this costs nothing when ProjectM is not on
-        screen.  Returns False (not dark) when the GL symbol cannot be loaded
-        so the detector degrades silently rather than skipping valid presets.
+        and pools every sampled byte from all five together into one set —
+        so a frame that's genuinely two-tone (half solid red, half solid
+        blue) reads as high combined variance and is correctly not flagged,
+        even though any individual block might look locally flat on its
+        own. Called every render() frame while a preset is active (see
+        ``_update_solid_color_tracking``), so this has to stay cheap: five
+        small 48×48 reads into a preallocated buffer, not a full-frame
+        readback, and no reallocation per call. Returns False (not solid)
+        when the GL symbol cannot be loaded, so the detector degrades
+        silently rather than skipping valid presets.
         """
         glrp = _get_glReadPixels()
         if glrp is None:
             return False
-        size = self._DARK_SAMPLE_SIZE
-        buf = (ctypes.c_uint8 * (size * size * 3))()
+        size = self._COLOR_SAMPLE_SIZE
+        buf = self._color_sample_buf
+        view = np.frombuffer(buf, dtype=np.uint8)
         total = 0
-        blocks = 0
-        for fx, fy in self._DARK_SAMPLE_POINTS:
+        total_sq = 0
+        n = 0
+        for fx, fy in self._COLOR_SAMPLE_POINTS:
             px = int(self.width * fx) - size // 2
             py = int(self.height * fy) - size // 2
             px = max(0, min(px, max(0, self.width - size)))
@@ -1625,36 +1674,78 @@ class ProjectMEffect(BaseEffect):
             try:
                 glrp(px, py, size, size, _GL_RGB, _GL_UNSIGNED_BYTE, buf)
             except Exception as exc:
-                log.debug('glReadPixels failed in dark detector: %s', exc)
+                log.debug('glReadPixels failed in solid-color detector: %s', exc)
                 return False
-            total += sum(buf)
-            blocks += 1
-        if blocks == 0:
+            total += int(view.sum())
+            total_sq += int(np.sum(view.astype(np.uint32) ** 2, dtype=np.uint64))
+            n += view.size
+        if n == 0:
             return False
-        brightness = total / (blocks * size * size * 3 * 255.0)
-        threshold = float(self.config.get('dark_brightness_threshold', 0.02))
-        log.debug('Dark check: brightness=%.4f threshold=%.4f blocks=%d preset=%s',
-                  brightness, threshold, blocks, self._active_label)
-        return brightness < threshold
+        mean = total / n
+        variance = max(0.0, total_sq / n - mean * mean)
+        std = variance ** 0.5
+        threshold = float(self.config.get('solid_color_std_threshold', _SOLID_COLOR_STD_THRESHOLD_DEFAULT))
+        log.debug('Solid-color check: std=%.2f threshold=%.2f preset=%s',
+                  std, threshold, self._active_label)
+        return std < threshold
+
+    def _update_solid_color_tracking(self) -> None:
+        """Sample this frame and track how long the screen has read as one
+        flat color, excluding the preset once that streak crosses
+        ``solid_color_duration``.
+
+        Runs every frame while active — unlike the old dark-only check,
+        this genuinely needs continuous monitoring: the streak has to
+        reset the instant a frame isn't flat, and a once-per-interval
+        snapshot can't distinguish "continuously flat for 0.2s" from "flat
+        for one sampled instant, twice." No warm-up grace period: a preset
+        that opens on a flat color and takes its time waking up reads
+        exactly as bad on a live stream as one that never recovers, so
+        both are caught identically (raise ``preset_warmup_frames`` instead
+        for a specific slow-building preset worth keeping).
+        """
+        now = time.monotonic()
+        last = self._solid_color_check_time
+        self._solid_color_check_time = now
+        if last is None:
+            return  # first sample since this preset loaded -- no elapsed baseline yet
+        elapsed = max(0.0, now - last)
+        if not self._is_frame_solid_color():
+            self._solid_color_duration = 0.0
+            return
+        self._solid_color_duration += elapsed
+        threshold = float(self.config.get('solid_color_duration', _SOLID_COLOR_DURATION_DEFAULT))
+        if self._solid_color_duration < threshold:
+            return
+        excluded_path = self._preset_paths[self._preset_index % len(self._preset_paths)]
+        log.warning('Solid-color preset auto-excluded: %s', excluded_path.name)
+        self._save_excluded_preset_entry(excluded_path)
+        self._drop_from_catalog_cache(excluded_path)
+        self._preset_paths.pop(self._preset_index % len(self._preset_paths))
+        if self._preset_paths:
+            self._preset_index = self._preset_index % len(self._preset_paths)
+            self._load_current_preset(False)
+        else:
+            log.warning('All presets excluded — no presets remain')
 
     @staticmethod
     def _dropin_root() -> Path:
         """Directory this drop-in lives in — the base for exclusion keys."""
         return Path(__file__).resolve().parent
 
-    def _dark_excluded_file(self) -> Path:
-        """Return path to the persistent dark-preset exclusion list."""
-        return self._dropin_root() / 'dark_excluded.txt'
+    def _excluded_presets_file(self) -> Path:
+        """Return path to the persistent auto-excluded-preset list."""
+        return self._dropin_root() / 'excluded_presets.txt'
 
     @classmethod
-    def _dark_key(cls, path: Path) -> str:
+    def _exclusion_key(cls, path: Path) -> str:
         """Relative POSIX key identifying a preset in the exclusion list.
 
         Keys are stored relative to the drop-in directory so the list keeps
         working when the repository is used from a different checkout.  The
         list used to hold absolute paths, which silently matched nothing in
         any clone but the one that wrote them — the whole list went dead and
-        every already-known-dark preset had to be re-detected the slow way.
+        every already-known-excluded preset had to be re-detected the slow way.
         """
         resolved = path.resolve()
         try:
@@ -1663,8 +1754,8 @@ class ProjectMEffect(BaseEffect):
             return resolved.as_posix()
 
     @classmethod
-    def _dark_key_for_abs(cls, abs_path: str) -> str:
-        """``_dark_key`` for an already-resolved path.
+    def _exclusion_key_for_abs(cls, abs_path: str) -> str:
+        """``_exclusion_key`` for an already-resolved path.
 
         The catalog build has the resolved path in hand from the cached file
         scan, so going back through ``Path.resolve()`` would re-issue one
@@ -1678,7 +1769,7 @@ class ProjectMEffect(BaseEffect):
         return text
 
     @classmethod
-    def _dark_key_from_line(cls, line: str) -> str:
+    def _exclusion_key_from_line(cls, line: str) -> str:
         """Normalize one stored line into a relative key.
 
         Accepts legacy absolute entries and rebases them onto this drop-in
@@ -1690,24 +1781,24 @@ class ProjectMEffect(BaseEffect):
             return ''
         if not text.startswith('/'):
             return text.lstrip('./')
-        idx = text.find(_DARK_PATH_MARKER)
+        idx = text.find(_EXCLUSION_PATH_MARKER)
         if idx >= 0:
-            return text[idx + len(_DARK_PATH_MARKER):]
+            return text[idx + len(_EXCLUSION_PATH_MARKER):]
         return text
 
-    def _load_dark_excluded(self) -> set[str]:
+    def _load_excluded_presets(self) -> set[str]:
         """Load the exclusion list as relative keys, migrating the file if needed.
 
         Rewrites the file in relative form (de-duplicated) the first time it
         encounters legacy absolute entries, so the migration happens once.
         """
-        f = self._dark_excluded_file()
+        f = self._excluded_presets_file()
         if not f.exists():
             return set()
         try:
             raw = f.read_text(encoding='utf-8').splitlines()
         except OSError as exc:
-            log.warning('Could not read dark_excluded.txt: %s', exc)
+            log.warning('Could not read excluded_presets.txt: %s', exc)
             return set()
 
         keys: list[str] = []
@@ -1718,7 +1809,7 @@ class ProjectMEffect(BaseEffect):
             if not stripped:
                 changed = True
                 continue
-            key = self._dark_key_from_line(stripped)
+            key = self._exclusion_key_from_line(stripped)
             if not key:
                 changed = True
                 continue
@@ -1733,21 +1824,21 @@ class ProjectMEffect(BaseEffect):
         if changed:
             try:
                 f.write_text('\n'.join(keys) + '\n', encoding='utf-8')
-                log.info('ProjectM dark-exclusion list migrated to relative paths '
+                log.info('ProjectM exclusion list migrated to relative paths '
                          '(%d entries, %d line(s) normalized/de-duplicated)',
                          len(keys), len(raw) - len(keys))
             except OSError as exc:
-                log.warning('Could not migrate dark_excluded.txt: %s', exc)
+                log.warning('Could not migrate excluded_presets.txt: %s', exc)
         return seen
 
-    def _save_dark_excluded_entry(self, path: Path) -> None:
+    def _save_excluded_preset_entry(self, path: Path) -> None:
         """Append a single preset to the persistent exclusion file."""
-        f = self._dark_excluded_file()
+        f = self._excluded_presets_file()
         try:
             with f.open('a', encoding='utf-8') as fh:
-                fh.write(self._dark_key(path) + '\n')
+                fh.write(self._exclusion_key(path) + '\n')
         except OSError as exc:
-            log.warning('Could not write dark_excluded.txt: %s', exc)
+            log.warning('Could not write excluded_presets.txt: %s', exc)
 
     @staticmethod
     def _drop_from_catalog_cache(path: Path) -> None:
@@ -1756,8 +1847,9 @@ class ProjectMEffect(BaseEffect):
         ``_init`` rebuilds ``_preset_paths`` from ``_catalog_cache`` on every
         effect switch, so without this a preset excluded at runtime comes
         straight back the next time ProjectM is activated — costing another
-        ``dark_skip_after`` of black screen and appending another duplicate
-        line — because the dark detector only popped the instance-local list.
+        ``solid_color_duration`` of a flat screen and appending another
+        duplicate line — because the detector only popped the instance-local
+        list.
         """
         global _catalog_cache
         with _catalog_lock:

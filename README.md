@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.10.4**
+**Version 0.11.0**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -125,6 +125,61 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 `docs/planning.md` and are intentionally staged separately.
 
 ## Changelog
+
+- **0.11.0** — Replaces the dark-only, once-per-interval check with a
+  continuous **solid-color** detector: any frame that reads as
+  functionally one flat color — any color, not just black — counts
+  toward a running streak, and the preset is permanently excluded once
+  that streak crosses `solid_color_duration` (default 0.2s). The streak
+  resets to zero the instant a frame isn't flat, so a preset that goes
+  solid black, recovers, then goes solid blue two seconds later still
+  gets caught on either span independently — they don't need to match or
+  connect. No warm-up grace period: a preset that opens on a flat color
+  and takes its time waking up reads exactly as bad on a live stream as
+  one that never recovers, so both are caught identically.
+
+  What actually distinguishes "solid" from "lively" is variance, not
+  brightness — a solid magenta or solid white frame has *high* average
+  brightness, so the old mean-brightness check could never have caught
+  it. The five 48×48 sample blocks (unchanged) are now pooled into one
+  combined set and their standard deviation compared against
+  `solid_color_std_threshold` (default 4.0, out of 255) — pooling across
+  all five, not per-block, means a frame that's genuinely two-tone (half
+  solid red, half solid blue) still reads as high-variance and is
+  correctly not flagged, even though each individual block might look
+  locally flat on its own.
+
+  Runs every render() frame while active (previously gated to roughly
+  once per `dark_skip_after`) — this genuinely needs continuous
+  monitoring; a once-per-interval snapshot can't distinguish
+  "continuously flat for 0.2s" from "flat for one sampled instant,
+  twice." The glReadPixels buffer is now preallocated once and reused
+  every frame rather than allocated fresh per check.
+
+  Persistent exclusion list renamed `dark_excluded.txt` →
+  `excluded_presets.txt` to match (the old file's ~7,400 hard-earned
+  entries are now orphaned — a full-library re-sweep at a fast preset
+  interval is the planned way to rebuild it against the new detector).
+  Config renamed to match: `dark_skip_enabled` →
+  `solid_color_skip_enabled`, `dark_skip_after` → `solid_color_duration`,
+  `dark_brightness_threshold` → `solid_color_std_threshold`.
+
+  Also adds a same-tick reentrancy guard in `_load_current_preset()`:
+  refuses a second preset load within one frame, logged at WARNING. This
+  is a defensive, contained fix for part of a confirmed-but-separate bug
+  (a preset sometimes gets swapped out again in well under a second,
+  with zero frames rendered in between — meaning no solid-color sample
+  ever gets a chance to run for it regardless of tuning); the
+  investigation traced the likely root cause to auto-vj-01's async
+  `goto_effect()` leaving `projectm_active()` reading a stale reference
+  during a crossfade, which is out of scope for this drop-in to fix on
+  its own.
+
+  9 regression tests for the new detector/streak-tracking/reentrancy
+  guard (`tests/test_solid_color_check.py`, superseding
+  `test_dark_check.py`); the main-repo's own
+  `tests/test_projectm_dark_exclusion.py` renamed to
+  `test_projectm_solid_color_exclusion.py` and updated to match.
 
 - **0.10.4** — Fixes the dark-preset check degrading from "once per
   `dark_skip_after` interval" into "every single frame" for the rest of
