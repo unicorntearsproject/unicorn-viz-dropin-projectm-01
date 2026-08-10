@@ -23,14 +23,18 @@ Three libprojectM-4 callbacks are wired to Python's logging system:
 
 Dark-preset detection
 ---------------------
-After ``dark_skip_after`` seconds on a preset (default 0.2 s — this is a VJ
-backdrop, not a MilkDrop viewer, so a multi-second warm-up reads as a dead
-screen), five 48×48 blocks spread across the framebuffer are sampled via
-``glReadPixels`` and averaged.  If the mean brightness is below
-``dark_brightness_threshold`` (default 0.02, i.e. 2 %), the preset is skipped
-and recorded permanently.  The check runs at most once per preset, never per
-frame, and only while ProjectM is the active effect.  Set ``dark_skip_enabled
-= false`` in ``[effects.ProjectMEffect]`` to disable.
+Every ``dark_skip_after`` seconds a preset stays active (default 0.2 s —
+this is a VJ backdrop, not a MilkDrop viewer, so a multi-second warm-up
+reads as a dead screen), five 48×48 blocks spread across the framebuffer
+are sampled via ``glReadPixels`` and averaged.  If the mean brightness is
+below ``dark_brightness_threshold`` (default 0.02, i.e. 2 %), the preset
+is skipped and recorded permanently.  The check re-arms every
+``dark_skip_after`` interval for as long as the preset stays active (not
+just once) — deliberately, so a preset that starts bright and fades to
+black over several seconds still gets caught, not just one that opens
+already dark.  It never runs more than once per interval; only while
+ProjectM is the active effect.  Set ``dark_skip_enabled = false`` in
+``[effects.ProjectMEffect]`` to disable.
 
 Excluded presets are recorded in ``dark_excluded.txt`` as paths **relative to
 this drop-in directory**, so the list keeps working from any checkout; legacy
@@ -48,7 +52,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.10.3'
+__version__ = '0.10.4'
 
 import ctypes
 import ctypes.util
@@ -1534,6 +1538,16 @@ class ProjectMEffect(BaseEffect):
                     dark_after = float(self.config.get('dark_skip_after', _DARK_SKIP_AFTER_DEFAULT))
                     if self._dark_skip_timer >= dark_after:
                         self._dark_check_needed = True
+                        # Reset for the *next* check, not just this one: without
+                        # this, the timer stays >= dark_after forever after the
+                        # first trip, so the moment render() clears
+                        # _dark_check_needed back to False next frame, this
+                        # branch re-arms it immediately -- degrading "check
+                        # once per dark_after interval" into "check every
+                        # single frame" for the rest of the preset's life
+                        # (confirmed live: one preset logged 307 dark checks
+                        # over its run instead of the intended handful).
+                        self._dark_skip_timer = 0.0
 
     def resize(self, width: int, height: int) -> None:
         super().resize(width, height)

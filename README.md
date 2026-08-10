@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.10.3**
+**Version 0.10.4**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -125,6 +125,35 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 `docs/planning.md` and are intentionally staged separately.
 
 ## Changelog
+
+- **0.10.4** — Fixes the dark-preset check degrading from "once per
+  `dark_skip_after` interval" into "every single frame" for the rest of
+  a preset's life. `update()` armed `_dark_check_needed` once
+  `_dark_skip_timer` crossed `dark_skip_after`, but never reset the
+  timer back to 0 — so the moment `render()` cleared the flag after
+  consuming one check, the very next frame's `update()` saw the timer
+  still pinned above threshold and re-armed it immediately. Confirmed
+  live via a real session log at DEBUG level: one preset logged 307
+  separate "Dark check" evaluations over its run instead of the
+  intended handful. Also fixes `__init__.py`'s eager relative import
+  (`from .projectm_effect import ProjectMEffect`), which broke pytest's
+  module import of this drop-in's own test tree exactly the way
+  webcam-01's `__init__.py` already documented and fixed for itself —
+  this drop-in never got the same fix, so it had no test suite at all
+  until now. First test suite for this drop-in: 6 regression tests for
+  the timer-arm/reset/re-arm sequence.
+
+  **Not yet fixed, still under investigation:** a second, separately
+  confirmed mechanism where a preset gets swapped out again within well
+  under a second of loading — sometimes with a second "ProjectM loading
+  preset" line appearing in the very next log line, zero frames
+  rendered in between — meaning the dark check literally never gets a
+  chance to run for that preset at all, regardless of `dark_skip_after`.
+  Five such zero-check loads found in one session log. Root cause looks
+  like a race between this drop-in's own `preset_duration` auto-advance
+  and an external caller (very likely auto-vj-01) forcing a preset
+  change in the same frame; needs auto-vj-01-side investigation to
+  confirm.
 
 - **0.10.3** — trashing a preset no longer rebuilds the catalog on the render
   thread at all. The playback list is pruned in place so the advance to the
