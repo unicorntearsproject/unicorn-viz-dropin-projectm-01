@@ -68,7 +68,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.11.0'
+__version__ = '0.12.0'
 
 import ctypes
 import ctypes.util
@@ -492,6 +492,9 @@ class ProjectMEffect(BaseEffect):
         ('ProjectM Presets', 'Ctrl+R', 'Random preset'),
         ('ProjectM Presets', 'Delete', 'Soft-delete selected preset to trash'),
         ('ProjectM Presets', 'Shift+Delete', 'Hard-delete selected preset'),
+        ('ProjectM Presets', 'Q (in Excluded category)', 'Move selected preset to quarantine'),
+        ('ProjectM Presets', 'R (in Quarantined category)', 'Restore selected preset to its original path'),
+        ('ProjectM Presets', 'Delete (in Quarantined category)', 'Permanently delete (no trash, no confirmation)'),
     ]
     _TOKEN_RE = re.compile(r'[a-z0-9]+')
 
@@ -801,7 +804,13 @@ class ProjectMEffect(BaseEffect):
             log.warning('ProjectM preset state migration failed: %s', exc)
 
     def _preset_trash_dir(self) -> Path:
-        """Return path to the local preset quarantine directory."""
+        """Return path to the soft-delete trash directory (Delete key, manual).
+
+        Not to be confused with quarantine/ (see ``_quarantine_dir``) --
+        trash is a flat, non-restorable-via-UI holding area for manually
+        deleted presets; quarantine preserves relative path structure and
+        supports 'r' to restore a preset back to its original location.
+        """
         return Path(__file__).parent / 'preset-trash'
 
     def _preset_states_dir(self) -> Path:
@@ -1191,8 +1200,19 @@ class ProjectMEffect(BaseEffect):
         return dict(sorted(counts.items(), key=lambda pair: pair[0].lower()))
 
     def preset_catalog(self) -> list[dict[str, object]]:
-        """Return a serializable snapshot of projectM preset catalog entries."""
-        return [
+        """Return a serializable snapshot of projectM preset catalog entries.
+
+        Appends three synthetic sections after the real catalog -- Excluded,
+        Quarantined, Disabled -- each only when non-empty. CatalogBrowser
+        derives its category tabs purely from whatever category_key values
+        are present across the fed-in entries (see unicornviz/
+        catalog_browser.py), so simply including these is enough for them
+        to show up as selectable categories; their '! ' prefix (same
+        convention as _exclude_dirs()'s '! Transition' default) keeps them
+        out of the '(all)' aggregate and visually apart from real,
+        path-derived categories.
+        """
+        entries: list[dict[str, object]] = [
             {
                 'path': str(item.path),
                 'display_name': item.display_name,
@@ -1204,6 +1224,40 @@ class ProjectMEffect(BaseEffect):
             }
             for item in self._preset_catalog
         ]
+
+        # Iterate a snapshot, not `entries` itself -- appending to the list
+        # we're iterating would also visit (and re-duplicate) each newly
+        # appended copy, since those are disabled too.
+        for entry in list(entries):
+            if not entry['enabled']:
+                entries.append({**entry, 'category_key': self.DISABLED_CATEGORY})
+
+        for key in sorted(self._load_excluded_presets()):
+            abs_path = self._dropin_root() / key
+            entries.append({
+                'path': str(abs_path),
+                'display_name': abs_path.stem,
+                'pack_name': '',
+                'category_path': [],
+                'category_key': self.EXCLUDED_CATEGORY,
+                'tags': [],
+                'enabled': False,
+                'kind': 'excluded',
+            })
+
+        for qpath in self._scan_quarantine_files():
+            entries.append({
+                'path': str(qpath),
+                'display_name': qpath.stem,
+                'pack_name': '',
+                'category_path': [],
+                'category_key': self.QUARANTINE_CATEGORY,
+                'tags': [],
+                'enabled': False,
+                'kind': 'quarantined',
+            })
+
+        return entries
 
     def enable_all_presets(self) -> int:
         """Enable all known presets and return the enabled count."""
@@ -1839,6 +1893,139 @@ class ProjectMEffect(BaseEffect):
                 fh.write(self._exclusion_key(path) + '\n')
         except OSError as exc:
             log.warning('Could not write excluded_presets.txt: %s', exc)
+
+    def _remove_excluded_preset_entry(self, key: str) -> None:
+        """Remove one relative key from the persistent exclusion file.
+
+        Used when a preset graduates from "excluded" to "quarantined" --
+        the file physically moves out of presets/, so leaving its old
+        exclusion-list entry behind would make it linger in the manager's
+        Excluded section pointing at a path that no longer holds it.
+        """
+        keys = self._load_excluded_presets()
+        if key not in keys:
+            return
+        keys.discard(key)
+        f = self._excluded_presets_file()
+        try:
+            f.write_text(('\n'.join(sorted(keys)) + '\n') if keys else '', encoding='utf-8')
+        except OSError as exc:
+            log.warning('Could not rewrite excluded_presets.txt: %s', exc)
+
+    # -- Quarantine -------------------------------------------------------
+    # A holding area between "auto-excluded" and "gone for good". Presets
+    # move here from presets/ via the manager's Excluded category ('q'),
+    # can be restored back to their exact original relative path ('r'), or
+    # permanently deleted (Delete -- no confirmation, no trash: everything
+    # here was already reviewed once by definition).
+
+    QUARANTINE_CATEGORY = '! Quarantined'
+    EXCLUDED_CATEGORY = '! Excluded'
+    DISABLED_CATEGORY = '! Disabled'
+
+    def _quarantine_dir(self) -> Path:
+        """Return path to the quarantine directory (sibling of presets/)."""
+        return self._dropin_root() / 'quarantine'
+
+    def _default_presets_root(self) -> Path:
+        """Return this drop-in's own bundled presets/ directory.
+
+        Quarantine only supports presets living under this root (see
+        ``_relative_to_presets_root``): preserving "quarantine/x/y.milk
+        mirrors presets/x/y.milk" for a preset living under an externally
+        configured ``preset_dir``/``preset_dirs`` root would need
+        remembering which root each file came from to restore it
+        correctly, and nothing in this project's actual config uses one.
+        """
+        return self._dropin_root() / 'presets'
+
+    def _relative_to_presets_root(self, abs_path: Path) -> Path | None:
+        """Return ``abs_path``'s subpath under presets/, or None if it isn't there."""
+        try:
+            return abs_path.resolve().relative_to(self._default_presets_root().resolve())
+        except (ValueError, OSError):
+            return None
+
+    def _scan_quarantine_files(self) -> list[Path]:
+        """Return every preset file currently sitting in quarantine/."""
+        root = self._quarantine_dir()
+        if not root.is_dir():
+            return []
+        return sorted(p for p in root.rglob('*') if p.suffix.lower() in {'.milk', '.prjm'})
+
+    def quarantine_preset(self, path_str: str) -> bool:
+        """Move an excluded preset from presets/ into quarantine/, preserving
+        its relative path, and drop its now-stale excluded_presets.txt entry.
+
+        Reuses ``_deleted_presets`` (the same set delete_presets() uses) to
+        mark the original path gone -- the cached filesystem walk
+        (``_scan_preset_files``) still lists it at its old location until
+        the next full rescan, and that's exactly the mechanism that already
+        stops a stale scan entry from resurrecting a moved-away preset.
+        """
+        source = Path(path_str)
+        rel = self._relative_to_presets_root(source)
+        if rel is None or not source.is_file():
+            log.warning('ProjectM: cannot quarantine (not under presets/): %s', path_str)
+            return False
+        source_key = str(source.resolve())
+        dest = self._quarantine_dir() / rel
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(dest))
+        except OSError as exc:
+            log.warning('ProjectM: quarantine move failed for %s: %s', path_str, exc)
+            return False
+        self._remove_excluded_preset_entry(self._exclusion_key(source))
+        self._deleted_presets.add(source_key)
+        self._save_preset_state()
+        log.info('ProjectM preset quarantined: %s', rel.as_posix())
+        return True
+
+    def restore_from_quarantine(self, path_str: str) -> bool:
+        """Move a quarantined preset back to its original path under presets/."""
+        source = Path(path_str)
+        try:
+            rel = source.resolve().relative_to(self._quarantine_dir().resolve())
+        except (ValueError, OSError):
+            log.warning('ProjectM: cannot restore (not under quarantine/): %s', path_str)
+            return False
+        dest = self._default_presets_root() / rel
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(dest))
+        except OSError as exc:
+            log.warning('ProjectM: restore move failed for %s: %s', path_str, exc)
+            return False
+        self._deleted_presets.discard(str(dest.resolve()))
+        self._save_preset_state()
+        # Unlike quarantine/delete, restoring genuinely needs a fresh walk:
+        # the cached scan has no record of a file at this path at all.
+        self.rescan_preset_files()
+        self.refresh_preset_catalog(background=True)
+        log.info('ProjectM preset restored from quarantine: %s', rel.as_posix())
+        return True
+
+    def delete_quarantined_preset(self, path_str: str) -> bool:
+        """Permanently delete a quarantined preset.
+
+        No trash, no confirmation: everything in quarantine/ was already
+        reviewed once by definition (it only ever arrives there via 'q'
+        on an already-auto-excluded preset).
+        """
+        target = Path(path_str)
+        try:
+            target.resolve().relative_to(self._quarantine_dir().resolve())
+        except (ValueError, OSError):
+            log.warning('ProjectM: refused to delete (not under quarantine/): %s', path_str)
+            return False
+        try:
+            target.unlink()
+        except OSError as exc:
+            log.warning('ProjectM: quarantine delete failed for %s: %s', path_str, exc)
+            return False
+        log.info('ProjectM quarantined preset permanently deleted: %s', target.name)
+        return True
 
     @staticmethod
     def _drop_from_catalog_cache(path: Path) -> None:

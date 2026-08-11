@@ -6,12 +6,18 @@ __pycache__/
 # Preset packs — fetch with install.sh, not tracked in git.  MilkDrop presets
 # were, in almost all cases, never released under an explicit license and their
 # authors retain copyright, so we redistribute none of them; each operator
-# fetches their own.  preset-trash/ holds presets culled at runtime and must
-# stay untracked for the same reason.
+# fetches their own.  preset-trash/ holds presets culled at runtime (soft
+# delete) and quarantine/ holds presets moved there from the manager's
+# Excluded category (restorable via 'r'); both must stay untracked for the
+# same reason as presets/ itself.
 presets/
 preset-trash/
+quarantine/
 
-# Per-machine dark-preset exclusion list (auto-populated at runtime)
+# Per-machine auto-exclusion list (auto-populated at runtime). Renamed from
+# dark_excluded.txt in 0.11.0 when the detector became solid-color, not
+# dark-only -- kept here too in case an older checkout still has one.
+excluded_presets.txt
 dark_excluded.txt
 
 # Preset manager state (runtime-generated, not source)

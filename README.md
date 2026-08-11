@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.11.0**
+**Version 0.12.0**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -101,6 +101,34 @@ texture pack's inner `textures/` folder so they resolve:
 texture_dirs = "drop-ins/projectm-01/presets/presets-milkdrop-texture-pack/textures"
 ```
 
+### Excluded / Quarantined / Disabled (manager categories)
+
+Three additional categories appear in the preset manager (`Ctrl+M`) — each
+only when it actually has something in it — visually set apart from real,
+path-derived categories (a leading `!` and a distinct accent colour), but
+reachable the same way: select them like any other category.
+
+- **`! Excluded`** — every preset currently listed in
+  `excluded_presets.txt` (auto-excluded by the solid-color detector, see
+  above). These files are still sitting in `presets/`, just skipped by the
+  scanner.
+- **`! Quarantined`** — presets moved out of `presets/` into `quarantine/`
+  (a sibling directory, git-ignored, mirroring the same relative path
+  structure — `presets/x/y.milk` becomes `quarantine/x/y.milk`).
+- **`! Disabled`** — every currently-disabled preset that's still on disk,
+  gathered into one place instead of having to hunt through each real
+  category. This is an additional view, not a move — a disabled preset
+  still appears in its normal category too.
+
+The full excluded → quarantined → gone workflow is entirely manual, one
+preset at a time, from inside the manager: select a preset in `! Excluded`
+and press `Q` to move it to `! Quarantined`; from there, `R` restores it to
+its exact original path, or `Delete` removes it permanently — no trash, no
+confirmation, since anything reaching quarantine was already reviewed once
+by definition. See `HELP_ENTRIES` in `projectm_effect.py` (surfaced in the
+app's own `H` help overlay) for the exact key bindings — this file doesn't
+duplicate them so they can't drift out of sync.
+
 ---
 
 ## Structured Docs
@@ -125,6 +153,45 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 `docs/planning.md` and are intentionally staged separately.
 
 ## Changelog
+
+- **0.12.0** — Preset manager gains three special categories (only shown
+  when non-empty): `! Excluded` (everything in `excluded_presets.txt`),
+  `! Quarantined` (presets moved out of `presets/` into a new `quarantine/`
+  sibling directory, preserving relative path structure), and `! Disabled`
+  (every disabled-but-present preset, gathered into one view). New actions:
+  `Q` moves a selected Excluded preset to quarantine and drops its stale
+  exclusion-list entry; `R` restores a Quarantined preset to its exact
+  original path; `Delete` on a Quarantined preset permanently deletes it —
+  no trash, no confirmation, since anything there was already reviewed
+  once by definition. `E`/`D` (enable/disable) are suppressed on Excluded/
+  Quarantined entries, which aren't part of the normal rotation.
+
+  New methods: `quarantine_preset()`, `restore_from_quarantine()`,
+  `delete_quarantined_preset()`, `_remove_excluded_preset_entry()`.
+  Quarantine reuses `_deleted_presets` (the same set `delete_presets()`
+  uses) to stop a stale cached filesystem-scan entry from resurrecting a
+  moved-away preset, the same mechanism the soft-delete trash already
+  relied on — no new bookkeeping concept, no expensive full rescan except
+  on restore (where one's actually needed, since the cache has no record
+  of a file at that path at all).
+
+  `preset_catalog()` now appends synthetic entries for the three sections;
+  `unicornviz/catalog_browser.py` (the shared model behind both this
+  manager and the effects browser) gained a small, generically useful
+  `HIDDEN_FROM_ALL_PREFIX` convention (categories starting with `!` are
+  reachable by selecting them directly but excluded from the `(all)`
+  catch-all view and its counts) so the new categories don't inflate or
+  duplicate into the "(all)" tally — reused, not projectM-specific.
+
+  32 new regression tests across
+  `drop-ins/projectm-01/tests/test_quarantine.py` (real filesystem moves
+  against a tmp_path tree — 16 tests),
+  `tests/test_catalog_browser.py` (5 new tests for the hidden-from-all
+  convention), and `tests/test_hotkeys_projectm_manager.py` (6 new tests
+  for the Q/R/Delete key routing). Caught and fixed a real bug before
+  shipping: an early version of the Disabled-section builder appended to
+  the same list it was iterating, re-visiting (and infinitely
+  re-duplicating) each newly appended copy since those are disabled too.
 
 - **0.11.0** — Replaces the dark-only, once-per-interval check with a
   continuous **solid-color** detector: any frame that reads as
