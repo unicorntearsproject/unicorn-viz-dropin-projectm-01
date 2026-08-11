@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.12.1**
+**Version 0.12.2**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -153,6 +153,30 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 `docs/planning.md` and are intentionally staged separately.
 
 ## Changelog
+
+- **0.12.2** — Fixes a crash-on-first-load bug in 0.12.1 itself, live-caught
+  in a real session within hours of shipping: `_excluded_presets_cache` was
+  initialised near the *end* of `_init()`, but the cold-catalog branch
+  (no `warm_up()` having run yet — exactly the case on a session's first
+  switch into ProjectM) calls `refresh_preset_catalog()` →
+  `_build_preset_catalog()` → `_load_excluded_presets()` earlier in
+  `_init()` than that, which reads the attribute before it exists:
+  `AttributeError: 'ProjectMEffect' object has no attribute
+  '_excluded_presets_cache'`. Two crashes in a row is enough to trip the
+  core app's (unrelated, pre-existing) session crash-quarantine, which
+  blocklists the *entire effect class* for the rest of the session — the
+  visible symptom was every playlist advance logging "Effect
+  ProjectMEffect is quarantined" and skipping straight past it, with
+  nothing actually quarantined in the new preset-manager sense. Fixed by
+  moving the cache initialization earlier in `_init()`, before the
+  `refresh_preset_catalog()` call. New regression test
+  (`test_init_does_not_crash_on_a_cold_catalog`) goes through the real
+  `ProjectMEffect(ctx, w, h, config)` constructor against a headless GL
+  context instead of the stub helper the rest of this file uses — the
+  stub bypasses `_init()` entirely and pre-sets the attribute itself, so
+  it structurally cannot catch an ordering bug *inside* `_init()`;
+  confirmed it reproduces the exact production traceback against the
+  0.12.1 code and passes against this fix.
 
 - **0.12.1** — Fixes a real performance regression introduced by 0.12.0,
   caught by profiling before it shipped further: `preset_catalog()` (which

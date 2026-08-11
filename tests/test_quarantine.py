@@ -13,6 +13,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import projectm_effect as pm  # noqa: E402
@@ -332,3 +334,30 @@ def test_preset_catalog_does_not_infinite_loop_when_many_presets_disabled(monkey
     entries = e.preset_catalog()
     disabled_rows = [x for x in entries if x['category_key'] == pm.ProjectMEffect.DISABLED_CATEGORY]
     assert len(disabled_rows) == 5   # not 10, not infinite
+
+
+# --------------------------------------------------------------------- _init
+
+def test_init_does_not_crash_on_a_cold_catalog(monkeypatch, tmp_path) -> None:
+    """Regression: _excluded_presets_cache was originally initialised near
+    the *end* of _init(), but the cold-catalog branch (_catalog_cache is
+    None) calls refresh_preset_catalog() -> _build_preset_catalog() ->
+    _load_excluded_presets() earlier than that, which read the attribute
+    before it existed. AttributeError, every time, on the very first
+    ProjectM load of a session (real repro: the first Ctrl+L of a run).
+    The _effect() stub above bypasses _init() entirely and pre-sets the
+    attribute itself, so it can't catch an ordering bug inside _init() --
+    this test goes through the real constructor instead."""
+    moderngl = pytest.importorskip('moderngl')
+    try:
+        ctx = moderngl.create_standalone_context()
+    except Exception as exc:  # pragma: no cover - environment dependent
+        pytest.skip(f'no headless GL context: {exc}')
+    _root(monkeypatch, tmp_path)
+    monkeypatch.setattr(pm, '_catalog_cache', None)
+    _write(tmp_path / 'presets' / 'x.milk')
+    try:
+        effect = pm.ProjectMEffect(ctx, 16, 16, {})
+        effect.destroy()
+    finally:
+        ctx.release()

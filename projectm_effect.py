@@ -68,7 +68,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.12.1'
+__version__ = '0.12.2'
 
 import ctypes
 import ctypes.util
@@ -517,6 +517,13 @@ class ProjectMEffect(BaseEffect):
         self._disabled_presets: set[str] = set()
         self._deleted_presets: set[str] = set()
         self._preset_index = 0
+        # See _load_excluded_presets(): caches the parsed exclusion-list
+        # keys so preset_catalog() (which runs on every manager keypress)
+        # doesn't re-read and re-parse a multi-thousand-line file that
+        # often. None means "not loaded yet"; invalidated to None again by
+        # the two methods that write the file. Must be set before
+        # refresh_preset_catalog() below, which reads it on a cold catalog.
+        self._excluded_presets_cache: set[str] | None = None
         self._load_preset_state()
 
         # Fast path: use the pre-built catalog from warm_up() or the last refresh.
@@ -552,12 +559,6 @@ class ProjectMEffect(BaseEffect):
         # _is_frame_solid_color() runs every render() frame, so a fresh
         # ctypes buffer per call would be a real per-frame allocation.
         self._color_sample_buf = (ctypes.c_uint8 * (self._COLOR_SAMPLE_SIZE ** 2 * 3))()
-        # See _load_excluded_presets(): caches the parsed exclusion-list
-        # keys so preset_catalog() (which runs on every manager keypress)
-        # doesn't re-read and re-parse a multi-thousand-line file that
-        # often. None means "not loaded yet"; invalidated to None again by
-        # the two methods that write the file.
-        self._excluded_presets_cache: set[str] | None = None
         # Set on every preset load, consumed by render(). Initialised here as
         # well because _load_current_preset() early-returns when no bridge or
         # no presets exist, and render() reads it unconditionally.
