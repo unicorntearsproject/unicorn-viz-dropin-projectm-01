@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.12.0**
+**Version 0.12.1**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -153,6 +153,43 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 `docs/planning.md` and are intentionally staged separately.
 
 ## Changelog
+
+- **0.12.1** — Fixes a real performance regression introduced by 0.12.0,
+  caught by profiling before it shipped further: `preset_catalog()` (which
+  runs on **every** ProjectM-manager keypress, not just when something
+  changes — `_sync_projectm_manager()` calls it unconditionally at the top
+  of the key handler) measured **166ms per call** against this owner's
+  ~9,800-preset library with a ~7,700-entry exclusion list — a very
+  noticeable stall on every single Up/Down navigation keypress.
+
+  Root cause: `_dropin_root()` calls `Path(__file__).resolve()`, a real
+  filesystem syscall, and the Excluded-section loop called it once *per
+  excluded entry* (7,676 redundant syscalls for a value that never
+  changes within one call). Fixed by hoisting it out of the loop, and
+  while in there, found and fixed the identical bug in the actual
+  catalog-rebuild hot loop (`_build_preset_catalog()`'s call to
+  `_exclusion_key_for_abs()`, pre-existing, not introduced by 0.12.0) —
+  `_exclusion_key_for_abs()` now accepts an optional pre-computed root so
+  a hot loop only pays the syscall once per pass instead of once per
+  preset (measured ~159ms for a ~10,000-preset library). Also added an
+  instance-level cache for `_load_excluded_presets()` (invalidated by the
+  two methods that write the file) so the multi-thousand-line file isn't
+  re-read and re-parsed on every keypress either, and switched the
+  Excluded-section entry builder from `Path` construction to plain string
+  ops (building ~7,700 `Path` objects per call was itself a meaningful
+  chunk of the remaining cost). End-to-end: 166ms → ~19–40ms per call.
+
+  Along the way, fixed a latent cross-platform bug in the new string-based
+  entry builder before it ever shipped: naively concatenating
+  `str(dropin_root)` with the (always forward-slash) exclusion key would
+  have produced a mixed-separator path string on Windows. Uses
+  `.as_posix()` for the root instead, so the whole path stays
+  forward-slash and re-parses correctly on any platform.
+
+  6 new regression tests for the caching behavior and the stale-scan-cache
+  interaction specifically (quarantining a preset must not let a cached
+  filesystem-scan entry resurrect it, without needing a full rescan to
+  stay correct — verified directly, not just by inspection this time).
 
 - **0.12.0** — Preset manager gains three special categories (only shown
   when non-empty): `! Excluded` (everything in `excluded_presets.txt`),

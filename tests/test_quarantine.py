@@ -28,6 +28,7 @@ def _effect(tmp_path: Path) -> 'pm.ProjectMEffect':
     e._deleted_presets = set()
     e._disabled_presets = set()
     e._preset_catalog = []
+    e._excluded_presets_cache = None
     # _save_preset_state()/refresh_preset_catalog() touch a lot of runtime
     # machinery unrelated to what's under test here; no-op them.
     e._save_preset_state = lambda: None
@@ -149,6 +150,106 @@ def test_remove_excluded_preset_entry_is_a_no_op_for_unknown_key(monkeypatch, tm
     e = _effect(tmp_path)
     e._remove_excluded_preset_entry('nonexistent.milk')
     assert (root / 'excluded_presets.txt').read_text(encoding='utf-8').splitlines() == ['a.milk']
+
+
+# ------------------------------------------------------------ excluded-presets cache
+
+def test_load_excluded_presets_is_cached_across_calls(monkeypatch, tmp_path) -> None:
+    """preset_catalog() calls this on every manager keypress -- a real
+    session log profiled re-reading + re-parsing a ~7,700-line file that
+    often as ~150ms of the cost. The second call must not touch disk."""
+    root = _root(monkeypatch, tmp_path)
+    (root / 'excluded_presets.txt').write_text('a.milk\n', encoding='utf-8')
+    e = _effect(tmp_path)
+
+    first = e._load_excluded_presets()
+    # Rewrite the file directly (bypassing the two methods that invalidate
+    # the cache) -- if the second call re-read from disk, it would see this.
+    (root / 'excluded_presets.txt').write_text('a.milk\nb.milk\n', encoding='utf-8')
+    second = e._load_excluded_presets()
+
+    assert first == second == {'a.milk'}
+
+
+def test_load_excluded_presets_returns_independent_copies(monkeypatch, tmp_path) -> None:
+    """Callers (e.g. _remove_excluded_preset_entry) mutate the returned set
+    directly -- that must never corrupt the cache for the next caller."""
+    root = _root(monkeypatch, tmp_path)
+    (root / 'excluded_presets.txt').write_text('a.milk\nb.milk\n', encoding='utf-8')
+    e = _effect(tmp_path)
+
+    first = e._load_excluded_presets()
+    first.clear()
+    second = e._load_excluded_presets()
+
+    assert second == {'a.milk', 'b.milk'}
+
+
+def test_save_excluded_preset_entry_invalidates_the_cache(monkeypatch, tmp_path) -> None:
+    root = _root(monkeypatch, tmp_path)
+    _write(root / 'presets' / 'new.milk')
+    e = _effect(tmp_path)
+    assert e._load_excluded_presets() == set()   # warms the cache empty
+
+    e._save_excluded_preset_entry(root / 'presets' / 'new.milk')
+
+    assert e._load_excluded_presets() == {'presets/new.milk'}
+
+
+def test_remove_excluded_preset_entry_invalidates_the_cache(monkeypatch, tmp_path) -> None:
+    root = _root(monkeypatch, tmp_path)
+    (root / 'excluded_presets.txt').write_text('a.milk\nb.milk\n', encoding='utf-8')
+    e = _effect(tmp_path)
+    assert e._load_excluded_presets() == {'a.milk', 'b.milk'}   # warms the cache
+
+    e._remove_excluded_preset_entry('a.milk')
+
+    assert e._load_excluded_presets() == {'b.milk'}
+
+
+def test_quarantine_preset_stops_a_stale_scan_cache_from_resurrecting_it(monkeypatch, tmp_path) -> None:
+    """quarantine_preset() deliberately does NOT force a full rescan (that's
+    the exact ~10,000-file / ~11s-freeze cost delete_presets() also avoids)
+    -- it relies on _deleted_presets, the same mechanism delete already
+    uses, to stop _build_preset_catalog() from re-adding a preset via a
+    filesystem-scan cache entry that still points at the old (now empty)
+    location."""
+    root = _root(monkeypatch, tmp_path)
+    source = _write(root / 'presets' / 'pack' / 'x.milk')
+    (root / 'excluded_presets.txt').write_text('presets/pack/x.milk\n', encoding='utf-8')
+    e = _effect(tmp_path)
+    e.config = {}
+
+    # Seed the module-level scan cache exactly as _scan_preset_files()
+    # would have, before the file ever moves.
+    prev_cache = pm._file_scan_cache
+    pm._file_scan_cache = [(source, root / 'presets', str(source.resolve()))]
+    try:
+        assert e.quarantine_preset(str(source)) is True
+        # The stale cache entry is still there -- quarantine_preset() must
+        # not need (or trigger) a rescan to stay correct.
+        assert pm._file_scan_cache == [(source, root / 'presets', str(source.resolve()))]
+
+        catalog = e._build_preset_catalog()
+        assert catalog == []   # not resurrected via the stale scan entry
+    finally:
+        pm._file_scan_cache = prev_cache
+
+
+def test_quarantine_preset_reflects_immediately_in_a_later_catalog_call(monkeypatch, tmp_path) -> None:
+    """End-to-end: quarantining must not leave a stale cached exclusion
+    list showing the preset in both Excluded and Quarantined at once."""
+    root = _root(monkeypatch, tmp_path)
+    source = _write(root / 'presets' / 'pack' / 'x.milk')
+    (root / 'excluded_presets.txt').write_text('presets/pack/x.milk\n', encoding='utf-8')
+    e = _effect(tmp_path)
+    assert any(x['category_key'] == pm.ProjectMEffect.EXCLUDED_CATEGORY for x in e.preset_catalog())
+
+    assert e.quarantine_preset(str(source)) is True
+
+    entries = e.preset_catalog()
+    assert not any(x['category_key'] == pm.ProjectMEffect.EXCLUDED_CATEGORY for x in entries)
+    assert any(x['category_key'] == pm.ProjectMEffect.QUARANTINE_CATEGORY for x in entries)
 
 
 # --------------------------------------------------------------- preset_catalog

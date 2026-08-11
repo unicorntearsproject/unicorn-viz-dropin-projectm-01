@@ -68,7 +68,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.12.0'
+__version__ = '0.12.1'
 
 import ctypes
 import ctypes.util
@@ -552,6 +552,12 @@ class ProjectMEffect(BaseEffect):
         # _is_frame_solid_color() runs every render() frame, so a fresh
         # ctypes buffer per call would be a real per-frame allocation.
         self._color_sample_buf = (ctypes.c_uint8 * (self._COLOR_SAMPLE_SIZE ** 2 * 3))()
+        # See _load_excluded_presets(): caches the parsed exclusion-list
+        # keys so preset_catalog() (which runs on every manager keypress)
+        # doesn't re-read and re-parse a multi-thousand-line file that
+        # often. None means "not loaded yet"; invalidated to None again by
+        # the two methods that write the file.
+        self._excluded_presets_cache: set[str] | None = None
         # Set on every preset load, consumed by render(). Initialised here as
         # well because _load_current_preset() early-returns when no bridge or
         # no presets exist, and render() reads it unconditionally.
@@ -1045,11 +1051,16 @@ class ProjectMEffect(BaseEffect):
         """Build catalog entries by applying current state to the file scan."""
         exclude = self._exclude_dirs()
         excluded_presets = self._load_excluded_presets()
+        # Hoisted out of the loop below: _exclusion_key_for_abs() otherwise
+        # recomputes _dropin_root() (a Path.resolve() syscall) once per
+        # scanned preset -- measured ~159ms for a ~10,000-preset library
+        # instead of a fraction of a ms.
+        dropin_root_posix = self._dropin_root().as_posix()
         entries: list[_PresetCatalogItem] = []
         for path, root, abs_path in self._scan_preset_files():
             if any(part.lower() in exclude for part in path.parts):
                 continue
-            if self._exclusion_key_for_abs(abs_path) in excluded_presets:
+            if self._exclusion_key_for_abs(abs_path, dropin_root_posix) in excluded_presets:
                 continue
             if abs_path in self._deleted_presets:
                 continue
@@ -1232,11 +1243,28 @@ class ProjectMEffect(BaseEffect):
             if not entry['enabled']:
                 entries.append({**entry, 'category_key': self.DISABLED_CATEGORY})
 
+        # Hoisted out of the loop below: _dropin_root() resolves a real
+        # filesystem path (Path.resolve() is a syscall) and never changes
+        # within one call -- calling it once per excluded entry measured
+        # at ~150ms for a ~7,700-entry exclusion list instead of ~1ms.
+        # String ops, not Path construction: building a Path object (and
+        # resolving its .stem) per excluded entry measured as most of this
+        # method's remaining cost even after hoisting _dropin_root() out of
+        # the loop -- ~7,700 Path() constructions adds up when this runs on
+        # every manager keypress.
+        # .as_posix(), not str(): key is always forward-slash (see
+        # _exclusion_key), so str() would mix native separators with it on
+        # Windows (backslash root + forward-slash suffix). A pure-forward-
+        # slash path string re-parses correctly on any platform later
+        # (e.g. quarantine_preset()'s Path(path_str)) -- Windows accepts
+        # '/' as a separator when parsing, just doesn't produce it itself.
+        dropin_root_posix = self._dropin_root().as_posix()
         for key in sorted(self._load_excluded_presets()):
-            abs_path = self._dropin_root() / key
+            name = key.rsplit('/', 1)[-1]
+            dot = name.rfind('.')
             entries.append({
-                'path': str(abs_path),
-                'display_name': abs_path.stem,
+                'path': f'{dropin_root_posix}/{key}',
+                'display_name': name[:dot] if dot > 0 else name,
                 'pack_name': '',
                 'category_path': [],
                 'category_key': self.EXCLUDED_CATEGORY,
@@ -1808,15 +1836,18 @@ class ProjectMEffect(BaseEffect):
             return resolved.as_posix()
 
     @classmethod
-    def _exclusion_key_for_abs(cls, abs_path: str) -> str:
+    def _exclusion_key_for_abs(cls, abs_path: str, _root: str | None = None) -> str:
         """``_exclusion_key`` for an already-resolved path.
 
         The catalog build has the resolved path in hand from the cached file
         scan, so going back through ``Path.resolve()`` would re-issue one
         syscall per preset -- thousands of them on every rebuild, for an
-        answer that cannot have changed.
+        answer that cannot have changed. ``_root`` lets a hot loop (e.g.
+        ``_build_preset_catalog()``) pass ``_dropin_root().as_posix()``
+        computed once for the whole pass instead of paying that syscall
+        again on every single call.
         """
-        root = cls._dropin_root().as_posix()
+        root = _root if _root is not None else cls._dropin_root().as_posix()
         text = abs_path.replace('\\', '/')
         if text.startswith(f'{root}/'):
             return text[len(root) + 1:]
@@ -1843,11 +1874,26 @@ class ProjectMEffect(BaseEffect):
     def _load_excluded_presets(self) -> set[str]:
         """Load the exclusion list as relative keys, migrating the file if needed.
 
+        Cached at the instance level (``_excluded_presets_cache``) and
+        returned as a fresh copy each call so callers remain free to mutate
+        their own copy (see ``_remove_excluded_preset_entry``) without
+        corrupting the cache. This file can run to thousands of lines, and
+        ``preset_catalog()`` (which calls this) runs on every ProjectM
+        manager keypress, not just when the exclusion list actually
+        changes -- reading + re-parsing it that often measured as most of
+        ``preset_catalog()``'s per-call cost. Invalidated by
+        ``_save_excluded_preset_entry`` / ``_remove_excluded_preset_entry``,
+        the only two places this instance ever writes the file.
+
         Rewrites the file in relative form (de-duplicated) the first time it
         encounters legacy absolute entries, so the migration happens once.
         """
+        if self._excluded_presets_cache is not None:
+            return set(self._excluded_presets_cache)
+
         f = self._excluded_presets_file()
         if not f.exists():
+            self._excluded_presets_cache = set()
             return set()
         try:
             raw = f.read_text(encoding='utf-8').splitlines()
@@ -1883,6 +1929,7 @@ class ProjectMEffect(BaseEffect):
                          len(keys), len(raw) - len(keys))
             except OSError as exc:
                 log.warning('Could not migrate excluded_presets.txt: %s', exc)
+        self._excluded_presets_cache = set(seen)
         return seen
 
     def _save_excluded_preset_entry(self, path: Path) -> None:
@@ -1893,6 +1940,8 @@ class ProjectMEffect(BaseEffect):
                 fh.write(self._exclusion_key(path) + '\n')
         except OSError as exc:
             log.warning('Could not write excluded_presets.txt: %s', exc)
+            return
+        self._excluded_presets_cache = None
 
     def _remove_excluded_preset_entry(self, key: str) -> None:
         """Remove one relative key from the persistent exclusion file.
@@ -1911,6 +1960,8 @@ class ProjectMEffect(BaseEffect):
             f.write_text(('\n'.join(sorted(keys)) + '\n') if keys else '', encoding='utf-8')
         except OSError as exc:
             log.warning('Could not rewrite excluded_presets.txt: %s', exc)
+            return
+        self._excluded_presets_cache = None
 
     # -- Quarantine -------------------------------------------------------
     # A holding area between "auto-excluded" and "gone for good". Presets
