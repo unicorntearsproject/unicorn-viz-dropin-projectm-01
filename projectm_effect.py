@@ -68,7 +68,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.12.2'
+__version__ = '0.12.3'
 
 import ctypes
 import ctypes.util
@@ -493,6 +493,7 @@ class ProjectMEffect(BaseEffect):
         ('ProjectM Presets', 'Delete', 'Soft-delete selected preset to trash'),
         ('ProjectM Presets', 'Shift+Delete', 'Hard-delete selected preset'),
         ('ProjectM Presets', 'Q (in Excluded category)', 'Move selected preset to quarantine'),
+        ('ProjectM Presets', 'Shift+Q (categories pane, Excluded/Disabled)', 'Quarantine every preset in that category'),
         ('ProjectM Presets', 'R (in Quarantined category)', 'Restore selected preset to its original path'),
         ('ProjectM Presets', 'Delete (in Quarantined category)', 'Permanently delete (no trash, no confirmation)'),
     ]
@@ -2030,9 +2031,55 @@ class ProjectMEffect(BaseEffect):
             return False
         self._remove_excluded_preset_entry(self._exclusion_key(source))
         self._deleted_presets.add(source_key)
+        # Same cleanup delete_presets() does on physical removal -- a
+        # disabled preset that gets quarantined would otherwise leave a
+        # permanently-stale, ever-growing entry in _disabled_presets (the
+        # file is gone; disabled-ness no longer means anything for it).
+        self._disabled_presets.discard(source_key)
         self._save_preset_state()
         log.info('ProjectM preset quarantined: %s', rel.as_posix())
         return True
+
+    def quarantine_category(self, category: str) -> int:
+        """Quarantine every preset currently shown under ``category``.
+
+        Restricted to the Excluded/Disabled virtual categories -- this
+        exists to clear a backlog of already-flagged presets in one go
+        (Shift+Q), not to bulk-quarantine arbitrary real content. Reuses
+        preset_catalog()'s existing category derivation as the single
+        source of truth for "what's in this category" rather than
+        re-deriving it, so this always matches what's on screen.
+
+        Unlike quarantine_preset() (deliberately rescan-free -- see its
+        own docstring -- since it's called one at a time, potentially
+        often), a Disabled-category sweep quarantines items that are
+        still sitting in self._preset_catalog (Excluded ones never are:
+        _build_preset_catalog() skips them during the scan). Left alone,
+        those entries would keep showing -- as both a real category row
+        and a Disabled row -- pointing at files that no longer exist,
+        until whatever next happened to trigger a refresh. Same
+        refresh_preset_catalog() call delete_presets() already makes
+        after its own batch; cheap here too since it reuses the cached
+        file scan rather than re-walking disk.
+        """
+        if category not in (self.EXCLUDED_CATEGORY, self.DISABLED_CATEGORY):
+            return 0
+        paths = [
+            entry['path']
+            for entry in self.preset_catalog()
+            if entry['category_key'] == category
+        ]
+        count = 0
+        for path in paths:
+            if self.quarantine_preset(path):
+                count += 1
+        # Only Disabled leaves stale self._preset_catalog entries behind
+        # (see docstring); Excluded is synthesized fresh from
+        # _load_excluded_presets() on every preset_catalog() call, so a
+        # refresh here would just repeat work for no visible effect.
+        if count > 0 and category == self.DISABLED_CATEGORY:
+            self.refresh_preset_catalog()
+        return count
 
     def restore_from_quarantine(self, path_str: str) -> bool:
         """Move a quarantined preset back to its original path under presets/."""

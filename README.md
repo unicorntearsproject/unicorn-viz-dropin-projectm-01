@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.12.2**
+**Version 0.12.3**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -153,6 +153,33 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 `docs/planning.md` and are intentionally staged separately.
 
 ## Changelog
+
+- **0.12.3** — Adds a "quarantine all" bulk action (`Shift+Q`, categories
+  pane, on the Excluded or Disabled tab) so a backlog of already-flagged
+  presets can be cleared in one press instead of one at a time. New
+  `quarantine_category()` reuses `preset_catalog()`'s existing category
+  derivation as the source of truth for "what's in this category", so it
+  always matches what's on screen, and is restricted to Excluded/Disabled
+  only — this is for clearing a backlog, not bulk-quarantining arbitrary
+  real content.
+
+  Disabled presets (unlike Excluded ones, which `_build_preset_catalog()`
+  already skips during the scan and so never enter `_preset_catalog` at
+  all) are still sitting in `_preset_catalog` right up until they're
+  quarantined — left alone, a rebuild wouldn't run and the just-quarantined
+  entries would keep showing (both under their real category and under
+  Disabled) pointing at files that no longer exist. Handled the same way
+  `delete_presets()` already handles its own batch: one
+  `refresh_preset_catalog()` call after the loop, which is cheap since it
+  reuses the cached file scan rather than re-walking disk. Excluded skips
+  that call entirely — nothing in `_preset_catalog` needs to change for it.
+
+  Also fixes a smaller pre-existing gap surfaced while adding this:
+  `quarantine_preset()` (the single-item `Q` action) never discarded the
+  quarantined path from `_disabled_presets`, so quarantining a disabled
+  preset one at a time left a permanently-stale, ever-growing entry
+  behind — same cleanup `delete_presets()` already does on physical
+  removal, now added here too.
 
 - **0.12.2** — Fixes a crash-on-first-load bug in 0.12.1 itself, live-caught
   in a real session within hours of shipping: `_excluded_presets_cache` was

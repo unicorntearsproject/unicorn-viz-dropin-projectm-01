@@ -87,6 +87,19 @@ def test_quarantine_preset_refuses_missing_file(monkeypatch, tmp_path) -> None:
     assert e.quarantine_preset(str(root / 'presets' / 'ghost.milk')) is False
 
 
+def test_quarantine_preset_discards_stale_disabled_entry(monkeypatch, tmp_path) -> None:
+    """Otherwise a disabled preset that gets quarantined leaves a
+    permanently-stale, ever-growing entry in _disabled_presets -- the file
+    is gone, so disabled-ness no longer means anything for it."""
+    root = _root(monkeypatch, tmp_path)
+    source = _write(root / 'presets' / 'x.milk')
+    e = _effect(tmp_path)
+    e._disabled_presets = {str(source.resolve())}
+
+    assert e.quarantine_preset(str(source)) is True
+    assert str(source.resolve()) not in e._disabled_presets
+
+
 # ---------------------------------------------------- restore_from_quarantine
 
 def test_restore_from_quarantine_moves_file_back(monkeypatch, tmp_path) -> None:
@@ -334,6 +347,97 @@ def test_preset_catalog_does_not_infinite_loop_when_many_presets_disabled(monkey
     entries = e.preset_catalog()
     disabled_rows = [x for x in entries if x['category_key'] == pm.ProjectMEffect.DISABLED_CATEGORY]
     assert len(disabled_rows) == 5   # not 10, not infinite
+
+
+# ------------------------------------------------------------ quarantine_category
+
+def test_quarantine_category_quarantines_all_excluded(monkeypatch, tmp_path) -> None:
+    root = _root(monkeypatch, tmp_path)
+    a = _write(root / 'presets' / 'a.milk')
+    b = _write(root / 'presets' / 'b.milk')
+    (root / 'excluded_presets.txt').write_text('presets/a.milk\npresets/b.milk\n', encoding='utf-8')
+    e = _effect(tmp_path)
+
+    assert e.quarantine_category(pm.ProjectMEffect.EXCLUDED_CATEGORY) == 2
+    assert not a.exists() and not b.exists()
+    assert (root / 'quarantine' / 'a.milk').is_file()
+    assert (root / 'quarantine' / 'b.milk').is_file()
+    entries = e.preset_catalog()
+    assert not any(x['category_key'] == pm.ProjectMEffect.EXCLUDED_CATEGORY for x in entries)
+
+
+def test_quarantine_category_quarantines_all_disabled_and_refreshes_catalog(monkeypatch, tmp_path) -> None:
+    root = _root(monkeypatch, tmp_path)
+    on_path = _write(root / 'presets' / 'on.milk')
+    off_a = _write(root / 'presets' / 'off_a.milk')
+    off_b = _write(root / 'presets' / 'off_b.milk')
+    e = _effect(tmp_path)
+    e.config = {}
+    e._preset_paths = []
+    e._preset_index = 0
+    e._preset_catalog = [
+        _catalog_item(pm, on_path, enabled=True),
+        _catalog_item(pm, off_a, enabled=False),
+        _catalog_item(pm, off_b, enabled=False),
+    ]
+    # Use the real refresh (not the stub's no-op) so this test actually
+    # proves the stale-entry problem the docstring describes is fixed:
+    # a disabled preset lives in self._preset_catalog itself (unlike
+    # Excluded, which never does), so quarantining it away must rebuild
+    # that list or a ghost row -- pointing at a file that no longer
+    # exists -- would keep showing in both Disabled and its real category.
+    e.refresh_preset_catalog = lambda *a, **k: pm.ProjectMEffect.refresh_preset_catalog(e, *a, **k)
+
+    # Seed the module-level scan cache directly (as test_quarantine_preset_
+    # stops_a_stale_scan_cache_from_resurrecting_it does above) so the
+    # rebuild reads these tmp_path entries instead of walking
+    # _preset_dirs() -- which falls back to this drop-in's own real
+    # presets/ directory, not tmp_path, when self.config is empty.
+    prev_cache = pm._file_scan_cache
+    pm._file_scan_cache = [
+        (on_path, root / 'presets', str(on_path.resolve())),
+        (off_a, root / 'presets', str(off_a.resolve())),
+        (off_b, root / 'presets', str(off_b.resolve())),
+    ]
+    try:
+        assert e.quarantine_category(pm.ProjectMEffect.DISABLED_CATEGORY) == 2
+        assert not off_a.exists() and not off_b.exists()
+        assert on_path.exists()
+
+        entries = e.preset_catalog()
+        disabled_rows = [x for x in entries if x['category_key'] == pm.ProjectMEffect.DISABLED_CATEGORY]
+        assert disabled_rows == []
+        real_rows = [x for x in entries if x['category_key'] not in (
+            pm.ProjectMEffect.EXCLUDED_CATEGORY, pm.ProjectMEffect.QUARANTINE_CATEGORY,
+            pm.ProjectMEffect.DISABLED_CATEGORY,
+        )]
+        assert {r['display_name'] for r in real_rows} == {'on'}
+    finally:
+        pm._file_scan_cache = prev_cache
+
+
+def test_quarantine_category_ignores_categories_other_than_excluded_or_disabled(monkeypatch, tmp_path) -> None:
+    root = _root(monkeypatch, tmp_path)
+    _write(root / 'presets' / 'pack' / 'x.milk')
+    e = _effect(tmp_path)
+    e._preset_catalog = [_catalog_item(pm, root / 'presets' / 'pack' / 'x.milk', enabled=True)]
+
+    assert e.quarantine_category('(all)') == 0
+    assert e.quarantine_category('pack') == 0
+    assert e.quarantine_category(pm.ProjectMEffect.QUARANTINE_CATEGORY) == 0
+    assert (root / 'presets' / 'pack' / 'x.milk').exists()
+
+
+def test_quarantine_category_returns_zero_and_skips_refresh_when_empty(monkeypatch, tmp_path) -> None:
+    root = _root(monkeypatch, tmp_path)
+    (root / 'presets').mkdir(parents=True)
+    e = _effect(tmp_path)
+    calls = []
+    e.refresh_preset_catalog = lambda *a, **k: calls.append(1)
+
+    assert e.quarantine_category(pm.ProjectMEffect.DISABLED_CATEGORY) == 0
+    assert e.quarantine_category(pm.ProjectMEffect.EXCLUDED_CATEGORY) == 0
+    assert calls == []
 
 
 # --------------------------------------------------------------------- _init
