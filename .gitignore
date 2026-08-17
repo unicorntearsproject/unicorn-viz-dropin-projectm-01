@@ -9,10 +9,14 @@ __pycache__/
 # fetches their own.  preset-trash/ holds presets culled at runtime (soft
 # delete) and quarantine/ holds presets moved there from the manager's
 # Excluded category (restorable via 'r'); both must stay untracked for the
-# same reason as presets/ itself.
+# same reason as presets/ itself. quarantine2/ is a manual, ad hoc bucket
+# (not wired into the manager UI) for presets pulled from the still-active
+# set by pattern-matching against quarantine/disabled, not by the live
+# detector -- see 2026-08-11 session notes.
 presets/
 preset-trash/
 quarantine/
+quarantine2/
 
 # Per-machine auto-exclusion list (auto-populated at runtime). Renamed from
 # dark_excluded.txt in 0.11.0 when the detector became solid-color, not
