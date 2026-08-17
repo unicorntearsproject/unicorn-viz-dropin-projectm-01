@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.12.3**
+**Version 0.12.4**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -153,6 +153,19 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 `docs/planning.md` and are intentionally staged separately.
 
 ## Changelog
+
+- **0.12.4** — Adds INFO-level logging for every user-triggered preset
+  manager action that didn't already have it: `delete_presets()`
+  (Delete/Shift+Delete — previously had zero success logging, only a
+  failure warning), `quarantine_category()` (Shift+Q — a bulk summary
+  line on top of the per-item lines `quarantine_preset()` already logs),
+  `enable_all_presets()`/`disable_all_presets()` (Ctrl+A/Ctrl+Shift+A),
+  `set_presets_enabled()` (E/D on a single preset),
+  `enable_category()`/`disable_category()` (E/D on a category tab),
+  `isolate_category()` (I), and `undo_last_bulk_state_change()`/
+  `redo_last_bulk_state_change()` (Ctrl+Z/Ctrl+Y — previously silent
+  either way). `quarantine_preset()`, `restore_from_quarantine()`, and
+  `delete_quarantined_preset()` already logged and were left as-is.
 
 - **0.12.3** — Adds a "quarantine all" bulk action (`Shift+Q`, categories
   pane, on the Excluded or Disabled tab) so a backlog of already-flagged

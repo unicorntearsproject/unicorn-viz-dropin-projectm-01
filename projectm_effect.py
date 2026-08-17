@@ -68,7 +68,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.12.3'
+__version__ = '0.12.4'
 
 import ctypes
 import ctypes.util
@@ -937,6 +937,7 @@ class ProjectMEffect(BaseEffect):
                 pass
             self._prune_snapshot_family('redo', keep=100)
             restored_action, restored_from = restored
+            log.info('ProjectM undo: restored %s (%s)', restored_action, restored_from)
             return f'{restored_action} ({restored_from})'
         return None
 
@@ -963,6 +964,7 @@ class ProjectMEffect(BaseEffect):
                 pass
             self._prune_snapshot_family('state', keep=100)
             restored_action, restored_from = restored
+            log.info('ProjectM redo: re-applied %s (%s)', restored_action, restored_from)
             return f'{restored_action} ({restored_from})'
         return None
 
@@ -1293,6 +1295,7 @@ class ProjectMEffect(BaseEffect):
         """Enable all known presets and return the enabled count."""
         if self._disabled_presets:
             self._snapshot_bulk_state('enable-all')
+            log.info('ProjectM: enabled all (%d preset(s) re-enabled)', len(self._disabled_presets))
         self._disabled_presets.clear()
         self._save_preset_state()
         self.refresh_preset_catalog()
@@ -1306,6 +1309,7 @@ class ProjectMEffect(BaseEffect):
             self._disabled_presets = next_disabled
             self._save_preset_state()
             self.refresh_preset_catalog()
+            log.info('ProjectM: disabled all (%d preset(s) now disabled)', len(self._disabled_presets))
         return len(self._preset_paths)
 
     def set_presets_enabled(self, preset_paths: list[str], enabled: bool) -> int:
@@ -1315,6 +1319,7 @@ class ProjectMEffect(BaseEffect):
             return len(self._preset_paths)
 
         changed = False
+        changed_count = 0
         for item in self._preset_catalog:
             path_key = str(item.path.resolve())
             if path_key not in normalized:
@@ -1323,20 +1328,28 @@ class ProjectMEffect(BaseEffect):
                 if path_key in self._disabled_presets:
                     self._disabled_presets.discard(path_key)
                     changed = True
+                    changed_count += 1
             else:
                 if path_key not in self._disabled_presets:
                     self._disabled_presets.add(path_key)
                     changed = True
+                    changed_count += 1
 
         if changed:
             self._save_preset_state()
             self.refresh_preset_catalog()
+            log.info(
+                'ProjectM: %s %d preset(s)',
+                'enabled' if enabled else 'disabled',
+                changed_count,
+            )
         return len(self._preset_paths)
 
     def enable_category(self, category: str) -> int:
         """Enable all presets inside one category subtree; return enabled count."""
         category_parts = self._normalize_category(category)
         changed = False
+        changed_count = 0
         for item in self._preset_catalog:
             if self._category_matches(item, category_parts):
                 path_key = str(item.path.resolve())
@@ -1345,15 +1358,18 @@ class ProjectMEffect(BaseEffect):
                         self._snapshot_bulk_state('enable-category')
                     self._disabled_presets.discard(path_key)
                     changed = True
+                    changed_count += 1
         if changed:
             self._save_preset_state()
             self.refresh_preset_catalog()
+            log.info('ProjectM: enabled category %s (%d preset(s))', category, changed_count)
         return len(self._preset_paths)
 
     def disable_category(self, category: str) -> int:
         """Disable all presets inside one category subtree; return enabled count."""
         category_parts = self._normalize_category(category)
         changed = False
+        changed_count = 0
         for item in self._preset_catalog:
             if self._category_matches(item, category_parts):
                 path_key = str(item.path.resolve())
@@ -1362,9 +1378,11 @@ class ProjectMEffect(BaseEffect):
                         self._snapshot_bulk_state('disable-category')
                     self._disabled_presets.add(path_key)
                     changed = True
+                    changed_count += 1
         if changed:
             self._save_preset_state()
             self.refresh_preset_catalog()
+            log.info('ProjectM: disabled category %s (%d preset(s))', category, changed_count)
         return len(self._preset_paths)
 
     def isolate_category(self, category: str) -> int:
@@ -1380,6 +1398,10 @@ class ProjectMEffect(BaseEffect):
             self._disabled_presets = next_disabled
             self._save_preset_state()
             self.refresh_preset_catalog()
+            log.info(
+                'ProjectM: isolated category %s (%d preset(s) disabled elsewhere)',
+                category, len(next_disabled),
+            )
         return len(self._preset_paths)
 
     def delete_preset(self, index: int | None = None, permanent: bool = False) -> str | None:
@@ -1462,6 +1484,11 @@ class ProjectMEffect(BaseEffect):
             self._deleted_presets.add(source_key)
             self._disabled_presets.discard(source_key)
             deleted_count += 1
+            log.info(
+                'ProjectM preset %s: %s',
+                'permanently deleted' if permanent else 'moved to trash',
+                source.name,
+            )
 
         if deleted_count <= 0:
             return 0
@@ -2079,6 +2106,10 @@ class ProjectMEffect(BaseEffect):
         # refresh here would just repeat work for no visible effect.
         if count > 0 and category == self.DISABLED_CATEGORY:
             self.refresh_preset_catalog()
+        # quarantine_preset() already logs each move individually; this
+        # summary line is what makes the bulk action itself findable in
+        # the log (Shift+Q on a large category is a lot of per-item lines).
+        log.info('ProjectM Shift+Q: quarantined %d preset(s) from %s', count, category)
         return count
 
     def restore_from_quarantine(self, path_str: str) -> bool:
