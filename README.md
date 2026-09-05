@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.12.4**
+**Version 0.12.5**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -154,6 +154,13 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 
 ## Changelog
 
+- **0.12.5** — **Startup catalog prewarm works again.** The throwaway stub
+  that builds the preset catalog before the splash never set
+  `_excluded_presets_cache`, which `_init()` adds; the exclusion-list
+  loader raised on it, both `prescan` and `warm_up` logged "catalog build
+  failed", and the first ProjectM activation paid the full preset-tree walk
+  on the main thread mid-transition. One attribute on the stub, plus a test
+  that builds the catalog through the stub path.
 - **0.12.4** — Adds INFO-level logging for every user-triggered preset
   manager action that didn't already have it: `delete_presets()`
   (Delete/Shift+Delete — previously had zero success logging, only a

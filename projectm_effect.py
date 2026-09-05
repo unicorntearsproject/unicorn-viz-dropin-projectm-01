@@ -68,7 +68,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.12.4'
+__version__ = '0.12.5'
 
 import ctypes
 import ctypes.util
@@ -615,6 +615,12 @@ class ProjectMEffect(BaseEffect):
             stub.config = config
             stub._disabled_presets = set()
             stub._deleted_presets = set()
+            # _init() sets this before its own catalog build; the stub never
+            # runs _init(), and without it _load_excluded_presets() raised
+            # AttributeError, both prescan and warm_up logged "catalog build
+            # failed", and the first ProjectM activation walked every preset
+            # file on the main thread at transition time (2026-09-05).
+            stub._excluded_presets_cache = None
             try:
                 stub._load_preset_state()
             except Exception as exc:
