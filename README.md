@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.12.5**
+**Version 0.12.6**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -154,6 +154,12 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 
 ## Changelog
 
+- **0.12.6** — **No exit-time `projectm_destroy()`.** The exit hook ran it
+  on a worker thread after the main GL context was already gone: GL calls
+  off their context are no-ops at best and, on a driver mid-teardown, an
+  abort at exit at worst — for resources the OS reclaims anyway. Removed
+  (owner decision, 2026-09-05 audit O3). Runtime re-init still destroys
+  the bridge properly on the main thread.
 - **0.12.5** — **Startup catalog prewarm works again.** The throwaway stub
   that builds the preset catalog before the splash never set
   `_excluded_presets_cache`, which `_init()` adds; the exclusion-list

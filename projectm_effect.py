@@ -68,14 +68,13 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.12.5'
+__version__ = '0.12.6'
 
 import ctypes
 import ctypes.util
 import logging
 import os
 import random
-import atexit
 import json
 import re
 import shutil
@@ -2190,25 +2189,11 @@ class ProjectMEffect(BaseEffect):
         self._fallback_prog.release()
 
 
-def _shutdown_shared_bridge() -> None:
-    global _shared_bridge
-    if _shared_bridge is not None:
-        bridge = _shared_bridge
-        _shared_bridge = None
-
-        def _destroy_worker() -> None:
-            try:
-                bridge.destroy()
-            except Exception:
-                pass
-
-        worker = threading.Thread(
-            target=_destroy_worker,
-            name='uv-projectm-destroy',
-            daemon=True,
-        )
-        worker.start()
-        worker.join(timeout=1.0)
-
-
-atexit.register(_shutdown_shared_bridge)
+# No exit-time teardown of the shared bridge (0.12.6, owner decision after the
+# 2026-09-05 audit).  An exit hook used to call projectm_destroy() on a
+# worker thread with a 1 s join.  By then the main GL context is already
+# gone, so on that thread every GL call libprojectM made while freeing its
+# textures/FBOs/shaders was a no-op at best and, on a driver mid-teardown,
+# an abort at exit at worst -- for resources the OS reclaims the moment the
+# process ends.  The runtime re-init path (ProjectMEffect re-creating the
+# bridge on the main thread) is unaffected and still destroys properly.
