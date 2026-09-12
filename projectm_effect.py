@@ -47,9 +47,10 @@ enough.  There is deliberately no warm-up grace period before tracking
 starts: a preset that opens on a flat color and takes its time waking up
 reads exactly as bad on a live stream as one that's permanently flat, so
 both trigger identically (raise ``preset_warmup_frames`` instead if a
-specific slow-building preset is worth keeping).  Set
-``solid_color_skip_enabled = false`` in ``[effects.ProjectMEffect]`` to
-disable the whole mechanism.
+specific slow-building preset is worth keeping).  Off by default (opt-in,
+2026-09-12: the library is already clean of flat presets) -- set
+``solid_color_skip_enabled = true`` in ``[effects.ProjectMEffect]`` to
+turn the mechanism back on.
 
 Excluded presets are recorded permanently in ``excluded_presets.txt`` as
 paths **relative to this drop-in directory**, so the list keeps working
@@ -68,7 +69,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.12.7'
+__version__ = '0.12.8'
 
 import ctypes
 import ctypes.util
@@ -1788,7 +1789,7 @@ class ProjectMEffect(BaseEffect):
                     not self._manager_preview_active
                     and not bool(self.config.get('lock_preset', False))
                     and self._preset_paths
-                    and bool(self.config.get('solid_color_skip_enabled', True))
+                    and bool(self.config.get('solid_color_skip_enabled', False))
                 ):
                     self._update_solid_color_tracking()
                 return

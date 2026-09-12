@@ -35,6 +35,9 @@ class _FakeBridge:
     def load_preset(self, path: str, smooth: bool) -> None:
         self.load_calls.append((path, smooth))
 
+    def render(self) -> None:
+        pass
+
 
 class _FakeGLReadPixels:
     """Mimics glReadPixels: fills the ctypes buffer with a chosen fill
@@ -117,6 +120,30 @@ def test_is_frame_solid_color_respects_custom_threshold(monkeypatch) -> None:
     monkeypatch.setattr(pm, '_get_glReadPixels', lambda: _FakeGLReadPixels([120, 130]))
     e_tight = _effect(solid_color_std_threshold=2.0)
     assert e_tight._is_frame_solid_color() is False
+
+
+# ------------------------------------------------------------------ render() gate
+
+def test_render_skips_solid_color_tracking_by_default() -> None:
+    """2026-09-12: opt-in by default -- the library is already clean of flat
+    presets, so the per-frame glReadPixels cost shouldn't be paid unless an
+    operator explicitly sets solid_color_skip_enabled = true."""
+    e = _effect()
+    del e.config['solid_color_skip_enabled']  # simulate an unset config key
+    e._prime_pending = 0
+    calls: list[None] = []
+    e._update_solid_color_tracking = lambda: calls.append(None)  # type: ignore[method-assign]
+    e.render()
+    assert calls == []
+
+
+def test_render_runs_solid_color_tracking_when_explicitly_enabled() -> None:
+    e = _effect(solid_color_skip_enabled=True)
+    e._prime_pending = 0
+    calls: list[None] = []
+    e._update_solid_color_tracking = lambda: calls.append(None)  # type: ignore[method-assign]
+    e.render()
+    assert calls == [None]
 
 
 # ------------------------------------------------------- _update_solid_color_tracking

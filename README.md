@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.12.7**
+**Version 0.12.8**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -154,6 +154,14 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 
 ## Changelog
 
+- **0.12.8** — **`solid_color_skip_enabled` now defaults to `false`**
+  (was `true`), opt-in instead of opt-out: the library is already clean
+  of flat presets, so the per-frame `glReadPixels` cost (even throttled
+  to 10 Hz as of 0.12.7) shouldn't be paid unless an operator explicitly
+  sets `solid_color_skip_enabled = true` in `[effects.ProjectMEffect]`.
+  Config already carried the explicit `false` from 0.12.7's rollout, so
+  this changes nothing for a config that already has the key set --
+  only a config with the key entirely absent.
 - **0.12.7** — **Per-frame `configure()` was ~165ms/frame; now a no-op
   once nothing has changed.** `update()` calls `_ProjectMBridge.configure()`
   every frame, and it unconditionally re-issued all seven ctypes setters
