@@ -68,7 +68,7 @@ keep.
 """
 from __future__ import annotations
 
-__version__ = '0.12.6'
+__version__ = '0.12.7'
 
 import ctypes
 import ctypes.util
@@ -254,6 +254,9 @@ class _ProjectMBridge:
         # Per-instance callbacks (stored so ctypes wrappers survive GC)
         self._switch_failed_cb: _SwitchFailedCbType | None = None
         self._switch_requested_cb: _SwitchRequestedCbType | None = None
+        # Last-applied configure() values, keyed the same as its own
+        # parameters -- see configure()'s docstring.
+        self._configured: tuple | None = None
 
     @property
     def handle(self):
@@ -275,17 +278,45 @@ class _ProjectMBridge:
         start_clean: bool,
         texture_dirs: list[str],
     ) -> None:
-        self._lib.projectm_set_window_size(self._handle, width, height)
-        self._lib.projectm_set_fps(self._handle, int(fps_hint))
-        self._lib.projectm_set_beat_sensitivity(self._handle, float(beat_sensitivity))
-        self._lib.projectm_set_preset_duration(self._handle, float(preset_duration))
-        self._lib.projectm_set_preset_locked(self._handle, bool(lock_preset))
-        self._lib.projectm_set_preset_start_clean(self._handle, bool(start_clean))
-        if texture_dirs:
-            arr = (ctypes.c_char_p * len(texture_dirs))(
-                *[path.encode('utf-8') for path in texture_dirs]
+        """Push runtime settings to libprojectM -- but only the ones that
+        actually changed since the last call.
+
+        ``update()`` calls this every frame (2026-09-12 perf finding: ~165ms/
+        frame here, mostly ``projectm_set_texture_search_paths`` -- static
+        config re-applied to the C API on every single frame is pure waste).
+        Each setter below is now independently diffed against the last
+        applied value and skipped when unchanged, so a steady-state frame
+        (nothing but ``fps_hint`` moving, since that's derived from live
+        ``dt``) does one cheap ctypes call instead of seven, and the
+        expensive texture-search-path rebuild -- static for the process's
+        whole life -- runs exactly once.
+        """
+        texture_key = tuple(texture_dirs)
+        current = (
+            int(width), int(height), int(fps_hint), float(beat_sensitivity),
+            float(preset_duration), bool(lock_preset), bool(start_clean), texture_key,
+        )
+        prev = self._configured
+        if prev == current:
+            return
+        if prev is None or (prev[0], prev[1]) != (current[0], current[1]):
+            self._lib.projectm_set_window_size(self._handle, current[0], current[1])
+        if prev is None or prev[2] != current[2]:
+            self._lib.projectm_set_fps(self._handle, current[2])
+        if prev is None or prev[3] != current[3]:
+            self._lib.projectm_set_beat_sensitivity(self._handle, current[3])
+        if prev is None or prev[4] != current[4]:
+            self._lib.projectm_set_preset_duration(self._handle, current[4])
+        if prev is None or prev[5] != current[5]:
+            self._lib.projectm_set_preset_locked(self._handle, current[5])
+        if prev is None or prev[6] != current[6]:
+            self._lib.projectm_set_preset_start_clean(self._handle, current[6])
+        if texture_key and (prev is None or prev[7] != current[7]):
+            arr = (ctypes.c_char_p * len(texture_key))(
+                *[path.encode('utf-8') for path in texture_key]
             )
-            self._lib.projectm_set_texture_search_paths(self._handle, arr, len(texture_dirs))
+            self._lib.projectm_set_texture_search_paths(self._handle, arr, len(texture_key))
+        self._configured = current
 
     def set_window_size(self, width: int, height: int) -> None:
         self._lib.projectm_set_window_size(self._handle, width, height)
@@ -605,10 +636,25 @@ class ProjectMEffect(BaseEffect):
         can call it concurrently without double-scanning; whichever arrives
         first does the work, the other returns immediately.  No GL — pure
         config + disk reads via a throwaway stub instance.
+
+        TEMPORARY (2026-09-12): timing breadcrumbs around each phase, added
+        to chase a boot-time regression (this call measured under 0.1s run
+        directly, but 8-15s inside a real boot) -- see the "call_start" line
+        for the thread-dispatch gap (time.perf_counter() at the moment this
+        function body actually begins executing vs. whenever
+        prescan_catalog_async()/warm_up() asked for the thread/call), the
+        "lock_wait" line for time spent blocked on _catalog_lock, and
+        "state_load"/"scan" for the two phases inside it. Remove once the
+        regression is found.
         """
         global _catalog_cache
+        _t_enter = time.perf_counter()
+        log.info('ProjectM %s: call_start thread=%s', source, threading.current_thread().name)
         with _catalog_lock:
+            _t_locked = time.perf_counter()
+            log.info('ProjectM %s: lock_wait %.3fs', source, _t_locked - _t_enter)
             if _catalog_cache is not None:
+                log.info('ProjectM %s: already warm, skipping', source)
                 return
             stub: ProjectMEffect = object.__new__(cls)
             stub.config = config
@@ -624,8 +670,12 @@ class ProjectMEffect(BaseEffect):
                 stub._load_preset_state()
             except Exception as exc:
                 log.warning('ProjectM %s: state load failed: %s', source, exc)
+            _t_state = time.perf_counter()
+            log.info('ProjectM %s: state_load %.3fs', source, _t_state - _t_locked)
             try:
                 _catalog_cache = stub._build_preset_catalog()
+                _t_scan = time.perf_counter()
+                log.info('ProjectM %s: scan %.3fs', source, _t_scan - _t_state)
                 log.info('ProjectM %s: catalog cached (%d entries)', source, len(_catalog_cache))
             except Exception as exc:
                 log.warning('ProjectM %s: catalog build failed: %s', source, exc)
@@ -641,6 +691,8 @@ class ProjectMEffect(BaseEffect):
         """
         if _catalog_cache is not None:
             return
+        # TEMPORARY (2026-09-12): see _build_catalog_cache's docstring.
+        log.info('ProjectM prescan: thread.start() called')
         threading.Thread(
             target=cls._build_catalog_cache,
             args=(config,),
@@ -673,10 +725,14 @@ class ProjectMEffect(BaseEffect):
         # thread — see prescan_catalog_async(), kicked off during the splash.
         # When it did, this call finds the cache already populated and only the
         # GL bridge below (which must stay on this, the GL, thread) remains.
+        # TEMPORARY (2026-09-12): see _build_catalog_cache's docstring.
+        _t_warmup0 = time.perf_counter()
         cls._build_catalog_cache(config, source='warm_up')
+        log.info('ProjectM warm_up: catalog phase %.3fs', time.perf_counter() - _t_warmup0)
 
         # Create the shared libprojectM bridge and pre-load one preset so the
         # GLSL compiler has already run before the first visible frame.
+        _t_bridge0 = time.perf_counter()
         if _shared_bridge is None:
             library_hint = str(config.get('projectm_library', '')).strip()
             try:
@@ -703,6 +759,8 @@ class ProjectMEffect(BaseEffect):
             except Exception as exc:
                 log.warning('ProjectM warm_up: bridge creation failed: %s', exc)
                 _shared_bridge = None
+        # TEMPORARY (2026-09-12): see _build_catalog_cache's docstring.
+        log.info('ProjectM warm_up: bridge phase %.3fs', time.perf_counter() - _t_bridge0)
 
     @property
     def current_label(self) -> str:
@@ -1757,6 +1815,14 @@ class ProjectMEffect(BaseEffect):
     _COLOR_SAMPLE_POINTS = ((0.50, 0.50), (0.25, 0.25), (0.75, 0.25),
                             (0.25, 0.75), (0.75, 0.75))
     _COLOR_SAMPLE_SIZE = 48
+    # 2026-09-12 perf finding: five glReadPixels calls every render() frame
+    # (60 fps) is a real per-frame cost. 10 Hz still resolves the default
+    # 0.2s solid_color_duration threshold in ~2 samples -- coarser than
+    # continuous monitoring, but the streak-reset logic in
+    # _update_solid_color_tracking() only cares about real elapsed time
+    # between samples, which this preserves exactly (it just samples that
+    # timeline less often).
+    _SOLID_COLOR_SAMPLE_INTERVAL_S = 0.1
 
     def _is_frame_solid_color(self) -> bool:
         """Return True when the current framebuffer samples as one flat color.
@@ -1806,22 +1872,30 @@ class ProjectMEffect(BaseEffect):
         return std < threshold
 
     def _update_solid_color_tracking(self) -> None:
-        """Sample this frame and track how long the screen has read as one
-        flat color, excluding the preset once that streak crosses
-        ``solid_color_duration``.
+        """Sample at up to ``_SOLID_COLOR_SAMPLE_INTERVAL_S`` (10 Hz) and
+        track how long the screen has read as one flat color, excluding the
+        preset once that streak crosses ``solid_color_duration``.
 
-        Runs every frame while active — unlike the old dark-only check,
-        this genuinely needs continuous monitoring: the streak has to
-        reset the instant a frame isn't flat, and a once-per-interval
-        snapshot can't distinguish "continuously flat for 0.2s" from "flat
-        for one sampled instant, twice." No warm-up grace period: a preset
-        that opens on a flat color and takes its time waking up reads
-        exactly as bad on a live stream as one that never recovers, so
-        both are caught identically (raise ``preset_warmup_frames`` instead
-        for a specific slow-building preset worth keeping).
+        Called every render() frame while active, but the actual
+        glReadPixels sample is throttled to 10 Hz (2026-09-12 perf finding:
+        five reads at full frame rate is a real per-frame cost). The streak
+        still has to reset the instant a *sampled* frame isn't flat -- a
+        once-per-interval snapshot can't distinguish "continuously flat for
+        0.2s" from "flat for one sampled instant, twice" -- but that only
+        requires continuous monitoring at the *sampling* rate, not the
+        render rate: ``elapsed`` below is the real wall-clock gap between
+        samples regardless of how many render() calls it spanned, so the
+        streak math is unchanged by how often we choose to look. No warm-up
+        grace period: a preset that opens on a flat color and takes its
+        time waking up reads exactly as bad on a live stream as one that
+        never recovers, so both are caught identically (raise
+        ``preset_warmup_frames`` instead for a specific slow-building
+        preset worth keeping).
         """
         now = time.monotonic()
         last = self._solid_color_check_time
+        if last is not None and (now - last) < self._SOLID_COLOR_SAMPLE_INTERVAL_S:
+            return  # not due for the next sample yet
         self._solid_color_check_time = now
         if last is None:
             return  # first sample since this preset loaded -- no elapsed baseline yet

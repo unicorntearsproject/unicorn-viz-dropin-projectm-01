@@ -133,6 +133,12 @@ def test_solid_color_tracking_first_call_establishes_baseline_no_accumulation(mo
 
 
 def test_solid_color_tracking_accumulates_and_excludes_after_threshold(monkeypatch) -> None:
+    """Clock steps are 0.12s each -- above _SOLID_COLOR_SAMPLE_INTERVAL_S
+    (0.1s, the 2026-09-12 throttle) so every call actually samples; two
+    samples' worth (0.24s) is what it takes to cross solid_color_duration
+    here, so the middle checkpoint only gets one "still under" call instead
+    of the pre-throttle test's two -- two samples each >=0.1s can't sum to
+    under 0.2s, so a second "still under" step isn't expressible anymore."""
     e = _effect(solid_color_duration=0.2)
     clock = [100.0]
     monkeypatch.setattr(pm.time, 'monotonic', lambda: clock[0])
@@ -147,14 +153,11 @@ def test_solid_color_tracking_accumulates_and_excludes_after_threshold(monkeypat
                          lambda self, smooth: loaded.append(smooth))
 
     e._update_solid_color_tracking()   # baseline @ t=100.0, no elapsed time yet
-    clock[0] = 100.05
-    e._update_solid_color_tracking()   # +0.05s -> duration=0.05
+    clock[0] = 100.12
+    e._update_solid_color_tracking()   # +0.12s -> duration=0.12, still under 0.2
     assert excluded == []
-    clock[0] = 100.15
-    e._update_solid_color_tracking()   # +0.10s -> duration=0.15, still under 0.2
-    assert excluded == []
-    clock[0] = 100.30
-    e._update_solid_color_tracking()   # +0.15s -> duration=0.30 >= 0.2 -> excluded
+    clock[0] = 100.24
+    e._update_solid_color_tracking()   # +0.12s -> duration=0.24 >= 0.2 -> excluded
     assert len(excluded) == 1
     assert excluded[0].name == 'a.milk'
     assert loaded == [False]
@@ -170,6 +173,13 @@ def test_solid_color_tracking_resets_streak_on_non_flat_frame(monkeypatch) -> No
     _is_frame_solid_color() -- it only has a "now", no "last" to diff
     against yet -- so it consumes no item from the sequence below; the
     four items map onto calls 2-5.
+
+    Clock steps are 0.15s/0.15s/0.15s/0.20s -- all safely above
+    _SOLID_COLOR_SAMPLE_INTERVAL_S (0.1s, the 2026-09-12 throttle), so
+    every call actually samples. (A 0.1s-exactly step is right on that
+    boundary and float-rounds to *below* 0.1 half the time -- not a
+    meaningful gap for what this test verifies, which is the reset
+    logic, not the throttle's own precision.)
     """
     e = _effect(solid_color_duration=0.2)
     clock = [100.0]
@@ -184,19 +194,19 @@ def test_solid_color_tracking_resets_streak_on_non_flat_frame(monkeypatch) -> No
     monkeypatch.setattr(pm.ProjectMEffect, '_load_current_preset', lambda self, smooth: None)
 
     e._update_solid_color_tracking()   # call 1: baseline, no item consumed, no elapsed time
-    clock[0] = 100.1
-    e._update_solid_color_tracking()   # call 2, item[0]=True: +0.1s -> duration=0.1
-    assert e._solid_color_duration == pytest.approx(0.1)
+    clock[0] = 100.15
+    e._update_solid_color_tracking()   # call 2, item[0]=True: +0.15s -> duration=0.15
+    assert e._solid_color_duration == pytest.approx(0.15)
     assert excluded == []
-    clock[0] = 100.2
+    clock[0] = 100.30
     e._update_solid_color_tracking()   # call 3, item[1]=False: resets to 0
     assert e._solid_color_duration == 0.0
     assert excluded == []
-    clock[0] = 100.3
-    e._update_solid_color_tracking()   # call 4, item[2]=True: +0.1s from the new baseline -> 0.1
-    assert e._solid_color_duration == pytest.approx(0.1)
     clock[0] = 100.45
-    e._update_solid_color_tracking()   # call 5, item[3]=True: +0.15s -> 0.25 >= 0.2 -> excluded
+    e._update_solid_color_tracking()   # call 4, item[2]=True: +0.15s from the new baseline -> 0.15
+    assert e._solid_color_duration == pytest.approx(0.15)
+    clock[0] = 100.65
+    e._update_solid_color_tracking()   # call 5, item[3]=True: +0.20s -> 0.35 >= 0.2 -> excluded
     assert len(excluded) == 1
 
 

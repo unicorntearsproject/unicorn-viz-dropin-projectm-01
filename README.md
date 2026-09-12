@@ -1,6 +1,6 @@
 # projectm-01 — ProjectM Effect
 
-**Version 0.12.6**
+**Version 0.12.7**
 
 
 A Unicorn Viz drop-in that embeds libprojectM / MilkDrop-style presets inside
@@ -154,6 +154,27 @@ The modal browser UI and hotkey wiring for interactive browsing are tracked in
 
 ## Changelog
 
+- **0.12.7** — **Per-frame `configure()` was ~165ms/frame; now a no-op
+  once nothing has changed.** `update()` calls `_ProjectMBridge.configure()`
+  every frame, and it unconditionally re-issued all seven ctypes setters
+  including `projectm_set_texture_search_paths` -- a static, process-lifetime
+  value re-applied 30-60x/second. `configure()` now diffs each parameter
+  against the last-applied value and only calls the matching
+  `projectm_set_*` setter when it actually changed, so a steady-state frame
+  (only `fps_hint`, derived from live `dt`, ever really moves) skips the
+  expensive texture-path rebuild entirely after the first call. Expected:
+  ~165ms -> ~45ms/frame.
+  **Solid-color check now samples at 10 Hz instead of every render() frame**
+  -- five `glReadPixels` calls at 60fps was a second real per-frame cost.
+  The streak-reset logic already tracked real elapsed wall-clock time
+  between samples rather than assuming one frame = one sample, so
+  throttling the *sampling* rate doesn't change what the detector can catch,
+  just how often it looks. `[effects.ProjectMEffect] solid_color_skip_enabled`
+  can still turn the whole check off, same as before.
+  **Also**: temporary diagnostic logging around the prescan/warm_up boot
+  path (`call_start`/`lock_wait`/`state_load`/`scan` timings), added while
+  chasing a boot-time regression report -- safe to leave in, or strip once
+  that's resolved.
 - **0.12.6** — **No exit-time `projectm_destroy()`.** The exit hook ran it
   on a worker thread after the main GL context was already gone: GL calls
   off their context are no-ops at best and, on a driver mid-teardown, an
